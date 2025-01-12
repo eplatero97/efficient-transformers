@@ -173,7 +173,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         mhash = mhash.hexdigest()[:16]
         return mhash
 
-    def export(self, export_dir: Optional[str] = None) -> str:
+    def export(self, export_dir: Optional[str] = None, include_4d_causal_mask: bool = False) -> str:
         """
         Exports the model to ``ONNX`` format using ``torch.onnx.export``.
 
@@ -194,6 +194,12 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
             "position_ids": torch.arange(seq_len, dtype=torch.int64).view(1, seq_len).repeat(bs, 1),
             "past_key_values": [[] for _ in range(self.num_layers)],
         }
+        if include_4d_causal_mask:
+            from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
+            position_ids = example_inputs["position_ids"]
+            target_length = position_ids.size(1)
+            attention_mask = _create_causal_mask(position_ids=position_ids, target_length=target_length)
+            example_inputs["attention_mask"] = attention_mask
         dynamic_axes = {
             "input_ids": {0: "batch_size", 1: "seq_len"},
             "position_ids": {0: "batch_size", 1: "seq_len"},
