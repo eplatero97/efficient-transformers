@@ -189,17 +189,17 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         kv_cache_shape = get_padding_shape_from_config(
             self.model.config, fbs if self.continuous_batching else bs, seq_len
         )
+        pids = torch.arange(seq_len, dtype=torch.int64).view(1, seq_len).repeat(bs, 1)
+        if include_4d_causal_mask:
+            pids.is_tree = True
         example_inputs = {
             "input_ids": torch.zeros((bs, seq_len), dtype=torch.int64),
-            "position_ids": torch.arange(seq_len, dtype=torch.int64).view(1, seq_len).repeat(bs, 1),
+            "position_ids": pids,
             "past_key_values": [[] for _ in range(self.num_layers)],
         }
         if include_4d_causal_mask:
-            from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
-            position_ids = example_inputs["position_ids"]
-            target_length = position_ids.size(1)
-            attention_mask = _create_causal_mask(position_ids=position_ids, target_length=target_length)
-            example_inputs["attention_mask"] = attention_mask
+            causal_mask = torch.zeros((1, 1, seq_len, seq_len), dtype=torch.bool)
+            example_inputs["attention_mask"] = causal_mask
         dynamic_axes = {
             "input_ids": {0: "batch_size", 1: "seq_len"},
             "position_ids": {0: "batch_size", 1: "seq_len"},

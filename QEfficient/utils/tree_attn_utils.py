@@ -7,45 +7,49 @@
 
 # https://github.com/FasterDecoding/Medusa/blob/main/medusa/model/utils.py
 
-import torch
+from typing import Optional
+
 import numpy as np
+import torch
 
 TOPK = 10
+
 
 def pad_path(path, length, pad_value=-2):
     """
     Pad the given path list with a specific value up to a specified length.
-    
+
     Parameters:
     - path (list): The original list that needs padding.
     - length (int): The desired length of the padded list.
     - pad_value (optional, default=-2): The value to use for padding.
-    
+
     Returns:
     - list: A new list based on the original path but padded to the desired length.
-    
+
     Example:
     >>> pad_path([1,2,3], 5)
     [1, 2, 3, -2, -2]
-    
+
     Note:
-    If the given path is already longer than the specified length, 
+    If the given path is already longer than the specified length,
     then no padding occurs, and the original path is returned.
     """
-    
+
     # Calculate the number of padding values needed by subtracting the length
     # of the path from the desired length.
     # Append the padding values to the original path and return the new list.
     return path + [pad_value] * (length - len(path))
 
+
 def generate_medusa_buffers(medusa_choices, device="cpu"):
     """
     Generate buffers for the Medusa structure based on the provided choices.
-    
+
     Parameters:
     - medusa_choices (list): A nested list representing tree in the Medusa structure.
     - device (str): Device to which the tensors should be moved. Default is "cuda".
-    
+
     Returns:
     - dict: A dictionary containing buffers related to the Medusa structure.
     """
@@ -63,7 +67,7 @@ def generate_medusa_buffers(medusa_choices, device="cpu"):
             depth_counts.append(0)
         depth_counts[depth - 1] += 1
         prev_depth = depth
-    
+
     # Create the attention mask for Medusa
     medusa_attn_mask = torch.eye(medusa_len, medusa_len)
     medusa_attn_mask[:, 0] = 1
@@ -76,7 +80,7 @@ def generate_medusa_buffers(medusa_choices, device="cpu"):
                 continue
             ancestor_idx = []
             for c in range(len(cur_medusa_choice) - 1):
-                ancestor_idx.append(sorted_medusa_choices.index(cur_medusa_choice[:c+1]) + 1)
+                ancestor_idx.append(sorted_medusa_choices.index(cur_medusa_choice[: c + 1]) + 1)
             medusa_attn_mask[j + start + 1, ancestor_idx] = 1
         start += depth_counts[i]
 
@@ -94,27 +98,29 @@ def generate_medusa_buffers(medusa_choices, device="cpu"):
     medusa_position_ids = torch.zeros(medusa_len, dtype=torch.long)
     start = 0
     for i in range(len(depth_counts)):
-        medusa_position_ids[start + 1: start + depth_counts[i] + 1] = i + 1
+        medusa_position_ids[start + 1 : start + depth_counts[i] + 1] = i + 1
         start += depth_counts[i]
 
     # Generate retrieval indices for Medusa structure verification
     retrieve_indices_nest = []
     retrieve_paths = []
     for i in range(len(sorted_medusa_choices)):
-        cur_medusa_choice = sorted_medusa_choices[-i-1]
+        cur_medusa_choice = sorted_medusa_choices[-i - 1]
         retrieve_indice = []
         if cur_medusa_choice in retrieve_paths:
             continue
         else:
             for c in range(len(cur_medusa_choice)):
-                retrieve_indice.append(sorted_medusa_choices.index(cur_medusa_choice[:c+1]))
-                retrieve_paths.append(cur_medusa_choice[:c+1])
+                retrieve_indice.append(sorted_medusa_choices.index(cur_medusa_choice[: c + 1]))
+                retrieve_paths.append(cur_medusa_choice[: c + 1])
         retrieve_indices_nest.append(retrieve_indice)
     max_length = max([len(x) for x in retrieve_indices_nest])
     retrieve_indices = [pad_path(path, max_length) for path in retrieve_indices_nest]
     retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
     retrieve_indices = retrieve_indices + 1
-    retrieve_indices = torch.cat([torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long), retrieve_indices], dim=1)
+    retrieve_indices = torch.cat(
+        [torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long), retrieve_indices], dim=1
+    )
 
     # Aggregate the generated buffers into a dictionary
     medusa_buffers = {
@@ -122,21 +128,20 @@ def generate_medusa_buffers(medusa_choices, device="cpu"):
         "tree_indices": medusa_tree_indices,
         "medusa_position_ids": medusa_position_ids,
         "retrieve_indices": retrieve_indices,
-        }
-    
+    }
+
     # Move the tensors in the dictionary to the specified device
     medusa_buffers = {
-        k: v.clone().to(device)
-        if isinstance(v, torch.Tensor)
-        else torch.tensor(v,  device=device)
+        k: v.clone().to(device) if isinstance(v, torch.Tensor) else torch.tensor(v, device=device)
         for k, v in medusa_buffers.items()
     }
     return medusa_buffers
 
+
 def generate_candidates(candidates_logit, topk_spec_logits, tree_indices, retrieve_indices):
     """
     Generate candidates based on provided logits and indices.
-    
+
     Parameters:
     - tree_logits (torch.Tensor): base + speculation logits, shape: [decode_batch_size, num_speculative_tokens+1, vocab_size]
     - logits (torch.Tensor): Standard logits from a language model.
@@ -155,42 +160,45 @@ def generate_candidates(candidates_logit, topk_spec_logits, tree_indices, retrie
         2. Tree candidates mapped from the Cartesian candidates using tree indices.
     """
     # Greedy decoding: Select the most probable candidate from the original logits.
-    #candidates_logit = torch.argmax(tree_logits[:, 0]).unsqueeze(0) # shape: [1, decode_batch_size]
+    # candidates_logit = torch.argmax(tree_logits[:, 0]).unsqueeze(0) # shape: [1, decode_batch_size]
     # Extract the TOPK candidates from the medusa logits.
-    #candidates_medusa_logits = torch.topk(spec_logits, TOPK, dim = -1).indices # shape: [decode_batch_size, num_speculative_tokens, TOPK]
+    # candidates_medusa_logits = torch.topk(spec_logits, TOPK, dim = -1).indices # shape: [decode_batch_size, num_speculative_tokens, TOPK]
 
     # Combine the selected candidate from the original logits with the topk medusa logits.
     bsz = candidates_logit.shape
-    candidates = np.concatenate([candidates_logit.reshape(bsz,1), topk_spec_logits.reshape(bsz,-1)], dim=-1) # shape: [bsz, num_speculative_tokens*TOPK+1]
-    #candidates = torch.cat([candidates_logit, topk_spec_logits.view(-1)], dim=-1) # shape: [1, decode_batch_size*num_speculative_tokens*TOPK+1]
+    candidates = np.concatenate(
+        [candidates_logit.reshape(bsz, 1), topk_spec_logits.reshape(bsz, -1)], dim=-1
+    )  # shape: [bsz, num_speculative_tokens*TOPK+1]
+    # candidates = torch.cat([candidates_logit, topk_spec_logits.view(-1)], dim=-1) # shape: [1, decode_batch_size*num_speculative_tokens*TOPK+1]
 
     # Map the combined candidates to the tree indices to get tree candidates.
-    tree_candidates = candidates[:, tree_indices] # shape: [bsz, num_nodes]
+    tree_candidates = candidates[:, tree_indices]  # shape: [bsz, num_nodes]
 
     # Extend the tree candidates by appending a zero.
-    tree_candidates_ext = np.concatenate([tree_candidates, np.zeros((bsz, 1), dtype=np.int32)], dim=-1) # shape: [bsz, n_nodes+1]
-    #tree_candidates_ext = torch.cat([tree_candidates, torch.zeros((1), dtype=torch.long, device=tree_candidates.device)], dim=0)
+    tree_candidates_ext = np.concatenate(
+        [tree_candidates, np.zeros((bsz, 1), dtype=np.int32)], dim=-1
+    )  # shape: [bsz, n_nodes+1]
+    # tree_candidates_ext = torch.cat([tree_candidates, torch.zeros((1), dtype=torch.long, device=tree_candidates.device)], dim=0)
 
     # Retrieve the cartesian candidates using the retrieve indices.
-    cart_candidates = tree_candidates_ext[:, retrieve_indices] # shape: [num_leafs, num_speculative_tokens+1]
+    cart_candidates = tree_candidates_ext[:, retrieve_indices]  # shape: [num_leafs, num_speculative_tokens+1]
 
     # Unsqueeze the tree candidates for dimension consistency.
-    #tree_candidates = tree_candidates.unsqueeze(0)
+    # tree_candidates = tree_candidates.unsqueeze(0)
     return cart_candidates, tree_candidates
 
 
-def create_4d_causal_mask(attention_mask, past_seen_tokens, tree_mask=None):
+def create_4d_causal_mask(
+    position_ids: np.ndarray, past_seen_tokens: int, tree_mask: Optional[np.ndarray] = None
+) -> np.ndarray:
     """
-    Creates a 4D mask used in transformer models.
+    Creates a QEff 4D mask that also integrates tree attention mask
 
     Parameters:
     ----------
-    attention_mask: array_like
-        The input attention mask.
-    past_seen_tokens: int
-        The number of tokens seen in the past.
-    tree_mask: array_like (optional)
-        An optional tree mask.
+    position_ids (np.ndarray): position ids, shape: [decode_batch_size, seq_len]
+    past_seen_tokens (int): number of previous tokens seen
+    tree_mask (Optional[np.ndarray]): tree attention mask, shape: [1, 1, tree_len, tree_len]
 
     Returns:
     -------
@@ -198,27 +206,16 @@ def create_4d_causal_mask(attention_mask, past_seen_tokens, tree_mask=None):
         A 4D mask with shape `(batch_size, 1, sequence_length, target_length)`.
     """
 
-    # Get the shapes of the input arrays
-    batch_size, sequence_length = attention_mask.shape
-    target_length = sequence_length + past_seen_tokens
-
-    # Create a full matrix filled with the minimum representable value
-    min_dtype = np.finfo(np.float32).min
-    causal_mask = np.full((sequence_length, target_length), fill_value=min_dtype)
-
-    # Set the upper triangular part to zero
-    causal_mask = np.triu(causal_mask, k=past_seen_tokens+1)
-
-    # Expand the mask to have an extra dimension at the beginning
-    causal_mask = causal_mask[np.newaxis, np.newaxis].repeat(batch_size, axis=0) # shape: [bsz, 1, sequence_length, target_length]
-
-    attention_mask_exp = np.expand_dims(attention_mask, axis=(1,2)).repeat(sequence_length, axis=2) # shape: [bsz, 1, sequence_length, sequence_length]
-    padding_mask = causal_mask[..., past_seen_tokens:] + attention_mask_exp
-    padding_mask = (padding_mask == 0)
-    causal_mask[..., past_seen_tokens:] = np.where(padding_mask, min_dtype, causal_mask[..., past_seen_tokens:])
+    # compute target length
+    seq_len = position_ids.shape[1]
+    target_len = seq_len + past_seen_tokens
+    query_indices = position_ids[:, :, np.newaxis]
+    kv_indices = np.arange(target_len).reshape(1, 1, -1)
+    causal_mask = kv_indices > query_indices
+    causal_mask = causal_mask[:, np.newaxis]  # shape: [1, 1, seq_len, target_len]
 
     if tree_mask is not None:
         tree_len = tree_mask.shape[-1]
-        causal_mask[:, :, -tree_len:, -tree_len:] = np.where(tree_mask[0,0].astype(np.int64), tree_mask, min_dtype)
+        causal_mask[:, :, :, -tree_len:] = tree_mask
 
     return causal_mask

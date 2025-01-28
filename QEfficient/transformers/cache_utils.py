@@ -66,10 +66,13 @@ class QEffDynamicCache(DynamicCache):
             k_out, v_out = key_states, value_states
         else:
             position_ids = cache_kwargs.get("position_ids")
-            # assert position ids are sequential for attention tree to work
-            bsz, sl = position_ids.shape
-            seq_position_ids = torch.arange(sl).unsqueeze(0).repeat(bsz,1) + position_ids[:,0:1] # sequential position ids
-            position_ids = torch.where(position_ids < 0, position_ids, seq_position_ids)
+            if position_ids.is_tree:
+                # assert position ids are sequential for attention tree to work
+                bsz, sl = position_ids.shape
+                seq_position_ids = (
+                    torch.arange(sl).view(1, -1).expand(bsz, -1) + position_ids[:, 0]
+                )  # sequential position ids
+                position_ids = torch.where(position_ids < 0, position_ids, seq_position_ids)
             batch_index = cache_kwargs.get("batch_index", None)  # Check and fetch batch index value form the kwargs
 
             # Scatter

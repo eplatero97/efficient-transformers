@@ -137,6 +137,38 @@ class QAICInferenceSession:
                 buffer.shape if len(buffer.shape) > 0 else (1,),
             )
 
+    def set_default_buffers(self, buffers: List[str]):
+        """
+        Set default buffer mapping for input and output
+
+        Args:
+            :buffer (Dict[str, np.ndarray]): Parameter for buffer mapping.
+        """
+
+        for buffer_name in buffers:
+            if buffer_name not in self.binding_index_map:
+                warn(f'Buffer: "{buffer_name}" not found')
+                continue
+            buffer_index = self.binding_index_map[buffer_name]
+            binding = self.bindings[buffer_index]
+            qbuffer = qaicrt.QBuffer(bytes(binding.size))
+            self.qbuffers[buffer_index] = qbuffer
+
+            itemsize = aic_to_np_dtype_mapping[binding.type].itemsize
+            dims = list(binding.dims)
+            buf_dims = (itemsize, dims)
+            self.buf_dims[buffer_index] = buf_dims
+
+    def unskip_buffers(self, skipped_buffer_names: List[str]):
+        """
+        unskip buffer mapping by setting default values
+
+        Args:
+            :unskipped_buffer_name: List[str]. List of buffer name to be unskipped.
+        """
+
+        self.set_default_buffers(skipped_buffer_names)
+
     def skip_buffers(self, skipped_buffer_names: List[str]):
         """
         skip buffer mapping for given list of buffer names
