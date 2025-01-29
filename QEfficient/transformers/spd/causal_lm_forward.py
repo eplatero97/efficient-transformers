@@ -120,6 +120,12 @@ def tlm_forward(
     else:
         logits = self.lm_head(hidden_states)
     logits = logits.float()
+    topk_logits: Optional[int] = getattr(self, "topk_logits", None)
+    if topk_logits:
+        if topk_logits == 1:
+            logits = logits.argmax(dim=2, keepdim=True)
+        else:
+            logits = logits.topk(k=topk_logits, dim=2).indices
 
     return CausalLMOutputWithPast(
         loss=None,

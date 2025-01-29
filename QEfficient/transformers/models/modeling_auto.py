@@ -49,7 +49,14 @@ class QEFFTransformersBase(QEFFBaseModel):
 
     @classmethod
     @with_replaced_quantizers
-    def from_pretrained(cls, pretrained_model_name_or_path: str, is_tlm: bool = False, *args, **kwargs):
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        is_tlm: bool = False,
+        topk_logits: Optional[int] = None,
+        *args,
+        **kwargs,
+    ):
         if kwargs.get("attn_implementation", None) not in {None, "eager"}:
             logger.warning('Updating attn_implementation="eager"')
 
@@ -59,7 +66,7 @@ class QEFFTransformersBase(QEFFBaseModel):
         kwargs.update({"attn_implementation": "eager", "low_cpu_mem_usage": False})
 
         model = cls._hf_auto_class.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        return cls(model, is_tlm=is_tlm)
+        return cls(model, is_tlm=is_tlm, topk_logits=topk_logits)
 
     @property
     def model_name(self) -> str:
@@ -99,6 +106,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         model: nn.Module,
         continuous_batching: bool = False,
         is_tlm: bool = False,
+        topk_logits: Optional[int] = None,
         **kwargs,
     ):
         model_class_name = model.__class__.__name__
@@ -119,14 +127,24 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         self.num_layers = model.config.num_hidden_layers
         self.continuous_batching = continuous_batching
 
-        if is_tlm:
+        if is_tlm or topk_logits:
+            if topk_logits:
+                assert isinstance(topk_logits, int)
+                setattr(self.model, "topk_logits", topk_logits)
             # TODO: It is possible to always apply this transform and make value of indices as last indices by default in PyTorch
             self.model, transformed = SpDTransform.apply(self.model)
         self.is_tlm = is_tlm
+        self.topk_logits = topk_logits
 
     @classmethod
     def from_pretrained(
-        cls, pretrained_model_name_or_path, continuous_batching: bool = False, is_tlm: bool = False, *args, **kwargs
+        cls,
+        pretrained_model_name_or_path,
+        continuous_batching: bool = False,
+        is_tlm: bool = False,
+        topk_logits: Optional[int] = None,
+        *args,
+        **kwargs,
     ):
         """
         This method serves as the easiest entry point into using QEfficient. The interface is designed to be similar to transformers.AutoModelForCausalLM.
@@ -158,7 +176,9 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
                 "full_batch_size argument is deprecated. Use continuous_batching=True instead.", DeprecationWarning, 2
             )
 
-        self = super().from_pretrained(pretrained_model_name_or_path, is_tlm=is_tlm, *args, **kwargs)
+        self = super().from_pretrained(
+            pretrained_model_name_or_path, is_tlm=is_tlm, topk_logits=topk_logits, *args, **kwargs
+        )
         self.continuous_batching = continuous_batching
         return self
 
@@ -169,6 +189,8 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         mhash.update(to_hashable(self.model.config.to_diff_dict()))
         mhash.update(to_hashable({"continuous_batching": self.continuous_batching}))
         mhash.update(to_hashable({"is_tlm": self.is_tlm}))
+        mhash.update(to_hashable({"topk_logits": self.topk_logits}))
+        mhash.update(to_hashable({"include_4d_causal_mask": self.include_4d_causal_mask}))
         mhash.update(to_hashable(self._transform_names()))
         mhash = mhash.hexdigest()[:16]
         return mhash
@@ -189,17 +211,16 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         kv_cache_shape = get_padding_shape_from_config(
             self.model.config, fbs if self.continuous_batching else bs, seq_len
         )
-        pids = torch.arange(seq_len, dtype=torch.int64).view(1, seq_len).repeat(bs, 1)
-        if include_4d_causal_mask:
-            pids.is_tree = True
         example_inputs = {
             "input_ids": torch.zeros((bs, seq_len), dtype=torch.int64),
-            "position_ids": pids,
+            "position_ids": torch.arange(seq_len, dtype=torch.int64).view(1, seq_len).repeat(bs, 1),
             "past_key_values": [[] for _ in range(self.num_layers)],
         }
+        self.include_4d_causal_mask = include_4d_causal_mask
         if include_4d_causal_mask:
             causal_mask = torch.zeros((1, 1, seq_len, seq_len), dtype=torch.bool)
             example_inputs["attention_mask"] = causal_mask
+            example_inputs["position_ids"].is_tree = True
         dynamic_axes = {
             "input_ids": {0: "batch_size", 1: "seq_len"},
             "position_ids": {0: "batch_size", 1: "seq_len"},
