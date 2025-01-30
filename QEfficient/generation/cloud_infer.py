@@ -142,7 +142,7 @@ class QAICInferenceSession:
         Set default buffer mapping for input and output
 
         Args:
-            :buffer (Dict[str, np.ndarray]): Parameter for buffer mapping.
+            :buffer (List[str]): Parameter for buffer mapping.
         """
 
         for buffer_name in buffers:

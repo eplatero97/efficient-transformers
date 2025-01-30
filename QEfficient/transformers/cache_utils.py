@@ -66,7 +66,7 @@ class QEffDynamicCache(DynamicCache):
             k_out, v_out = key_states, value_states
         else:
             position_ids = cache_kwargs.get("position_ids")
-            if position_ids.is_tree:
+            if getattr(position_ids, "is_tree", False):
                 # assert position ids are sequential for attention tree to work
                 bsz, sl = position_ids.shape
                 seq_position_ids = (
