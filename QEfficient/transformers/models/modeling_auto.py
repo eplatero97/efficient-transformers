@@ -54,6 +54,7 @@ class QEFFTransformersBase(QEFFBaseModel):
         pretrained_model_name_or_path: str,
         is_tlm: bool = False,
         topk_logits: Optional[int] = None,
+        include_4d_causal_mask: bool = False,
         *args,
         **kwargs,
     ):
@@ -66,7 +67,7 @@ class QEFFTransformersBase(QEFFBaseModel):
         kwargs.update({"attn_implementation": "eager", "low_cpu_mem_usage": False})
 
         model = cls._hf_auto_class.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        return cls(model, is_tlm=is_tlm, topk_logits=topk_logits)
+        return cls(model, is_tlm=is_tlm, topk_logits=topk_logits, include_4d_causal_mask=include_4d_causal_mask)
 
     @property
     def model_name(self) -> str:
@@ -107,6 +108,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         continuous_batching: bool = False,
         is_tlm: bool = False,
         topk_logits: Optional[int] = None,
+        include_4d_causal_mask: bool = False,
         **kwargs,
     ):
         model_class_name = model.__class__.__name__
@@ -126,6 +128,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         self.model.config.use_cache = True
         self.num_layers = model.config.num_hidden_layers
         self.continuous_batching = continuous_batching
+        self.include_4d_causal_mask = include_4d_causal_mask
 
         if is_tlm or topk_logits:
             if topk_logits:
@@ -143,6 +146,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         continuous_batching: bool = False,
         is_tlm: bool = False,
         topk_logits: Optional[int] = None,
+        include_4d_causal_mask: bool = False,
         *args,
         **kwargs,
     ):
@@ -177,7 +181,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
             )
 
         self = super().from_pretrained(
-            pretrained_model_name_or_path, is_tlm=is_tlm, topk_logits=topk_logits, *args, **kwargs
+            pretrained_model_name_or_path, is_tlm=is_tlm, topk_logits=topk_logits, include_4d_causal_mask=include_4d_causal_mask, *args, **kwargs
         )
         self.continuous_batching = continuous_batching
         return self
@@ -195,7 +199,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         mhash = mhash.hexdigest()[:16]
         return mhash
 
-    def export(self, export_dir: Optional[str] = None, include_4d_causal_mask: bool = False) -> str:
+    def export(self, export_dir: Optional[str] = None) -> str:
         """
         Exports the model to ``ONNX`` format using ``torch.onnx.export``.
 
@@ -216,15 +220,19 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
             "position_ids": torch.arange(seq_len, dtype=torch.int64).view(1, seq_len).repeat(bs, 1),
             "past_key_values": [[] for _ in range(self.num_layers)],
         }
-        self.include_4d_causal_mask = include_4d_causal_mask
-        if include_4d_causal_mask:
-            causal_mask = torch.zeros((1, 1, seq_len, seq_len), dtype=torch.bool)
-            example_inputs["attention_mask"] = causal_mask
-            example_inputs["position_ids"].is_tree = True
         dynamic_axes = {
             "input_ids": {0: "batch_size", 1: "seq_len"},
             "position_ids": {0: "batch_size", 1: "seq_len"},
         }
+        if self.include_4d_causal_mask:
+            causal_mask = torch.zeros((bs, 1, seq_len, seq_len), dtype=torch.bool)
+            example_inputs["attention_mask"] = causal_mask
+            example_inputs["position_ids"].is_tree = True
+            dynamic_axes["attention_mask"] = {
+                0: "full_batch_size" if self.continuous_batching else "batch_size", 
+                2: "seq_len", 
+                3: "ctx_len"
+            }
         if len(kv_cache_shape) == 3:  # For GPTBigCode arch the pkv is 3d
             pkv_dynamic_axes = {
                 0: "full_batch_size" if self.continuous_batching else "batch_size",
@@ -306,10 +314,10 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
                     f"`num_speculative_tokens` arg should be an integer greater than 1, got {num_speculative_tokens}"
                 )
             num_logits_to_keep = num_speculative_tokens + 1
-            if prefill_seq_len < num_logits_to_keep:
-                raise ValueError(
-                    f"sequence length ({prefill_seq_len}) must be at least `num_speculative_tokens+1` ({num_logits_to_keep})"
-                )
+#            if prefill_seq_len < num_logits_to_keep:
+#                raise ValueError(
+#                    f"sequence length ({prefill_seq_len}) must be at least `num_speculative_tokens+1` ({num_logits_to_keep})"
+#                )
 
         if self.continuous_batching and full_batch_size is None:
             raise TypeError("missing required argument: 'full_batch_size'")

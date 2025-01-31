@@ -39,7 +39,6 @@ def _create_causal_mask(
         attention_mask = attention_mask | window_mask
         attention_mask = attention_mask.unsqueeze(1)
     else:
-        #breakpoint()
         query_indices = position_ids.unsqueeze(-1)
         kv_indices = torch.arange(target_length).view(1, 1, -1)
         attention_mask = kv_indices > query_indices

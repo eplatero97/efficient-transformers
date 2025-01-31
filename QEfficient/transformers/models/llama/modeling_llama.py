@@ -209,7 +209,6 @@ class QEffLlamaAttention(LlamaAttention):
                 )
             kv_seq_len = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-        breakpoint()
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -223,8 +222,6 @@ class QEffLlamaAttention(LlamaAttention):
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        print(f"{attn_weights.shape}")
-        breakpoint()
         if attention_mask is not None:  # no matter the length, we just slice it
             attn_weights = torch.where(attention_mask, torch.tensor(-10000.0, dtype=torch.float32), attn_weights)
 
@@ -516,8 +513,6 @@ class QEffLlamaModel(LlamaModel):
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, position_ids, past_key_values, output_attentions
         )
-        print(f"{causal_mask}, {causal_mask.shape}")
-        breakpoint()
 
         # embed positions
         hidden_states = inputs_embeds
@@ -615,8 +610,6 @@ class QEffLlamaModel(LlamaModel):
         # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
         # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
         # to infer the attention mask.
-        print(f"{past_key_values.get_seq_length()}")
-        breakpoint()
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         using_static_cache = isinstance(past_key_values, StaticCache)
 
@@ -647,7 +640,6 @@ class QEffLlamaModel(LlamaModel):
             causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
             if sequence_length != 1:
                 causal_mask = torch.triu(causal_mask, diagonal=1)
-            #breakpoint()
             causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
             causal_mask = causal_mask[None, None, :, :].expand(input_tensor.shape[0], 1, -1, -1)
             if attention_mask is not None:

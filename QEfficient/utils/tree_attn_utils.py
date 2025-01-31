@@ -143,16 +143,10 @@ def generate_candidates(candidates_logit, topk_spec_logits, tree_indices, retrie
     Generate candidates based on provided logits and indices.
 
     Parameters:
-    - tree_logits (torch.Tensor): base + speculation logits, shape: [decode_batch_size, num_speculative_tokens+1, vocab_size]
-    - logits (torch.Tensor): Standard logits from a language model.
+    - candidates_logit (np.ndarray): base logits, shape: [decode_batch_size, 1]
+    - topk_spec_logits (torch.Tensor): Standard logits from a language model, shape: [decode_batch_size, num_speculative_tokens, TOPK]
     - tree_indices (list or torch.Tensor): Indices representing a tree structure, used for mapping candidates.
     - retrieve_indices (list or torch.Tensor): Indices for extracting specific candidate tokens.
-    - temperature (float, optional): Controls the diversity of the sampling process. Defaults to 0.
-    - posterior_threshold (float, optional): Threshold for typical sampling. Defaults to 0.3.
-    - posterior_alpha (float, optional): Scaling factor for the entropy-based threshold in typical sampling. Defaults to 0.09.
-    - top_p (float, optional): Cumulative probability threshold for nucleus sampling. Defaults to 0.8.
-    - sampling (str, optional): Defines the sampling strategy ('typical' or 'nucleus'). Defaults to 'typical'.
-    - fast (bool, optional): If True, enables faster, deterministic decoding for typical sampling. Defaults to False.
 
     Returns:
     - tuple (torch.Tensor, torch.Tensor): A tuple containing two sets of candidates:
@@ -165,9 +159,9 @@ def generate_candidates(candidates_logit, topk_spec_logits, tree_indices, retrie
     # candidates_medusa_logits = torch.topk(spec_logits, TOPK, dim = -1).indices # shape: [decode_batch_size, num_speculative_tokens, TOPK]
 
     # Combine the selected candidate from the original logits with the topk medusa logits.
-    bsz = candidates_logit.shape
+    bsz = candidates_logit.shape[0]
     candidates = np.concatenate(
-        [candidates_logit.reshape(bsz, 1), topk_spec_logits.reshape(bsz, -1)], dim=-1
+        [candidates_logit, topk_spec_logits.reshape(bsz, -1)], axis=-1
     )  # shape: [bsz, num_speculative_tokens*TOPK+1]
     # candidates = torch.cat([candidates_logit, topk_spec_logits.view(-1)], dim=-1) # shape: [1, decode_batch_size*num_speculative_tokens*TOPK+1]
 
@@ -176,7 +170,7 @@ def generate_candidates(candidates_logit, topk_spec_logits, tree_indices, retrie
 
     # Extend the tree candidates by appending a zero.
     tree_candidates_ext = np.concatenate(
-        [tree_candidates, np.zeros((bsz, 1), dtype=np.int32)], dim=-1
+        [tree_candidates, np.zeros((bsz, 1), dtype=np.int32)], axis=-1
     )  # shape: [bsz, n_nodes+1]
     # tree_candidates_ext = torch.cat([tree_candidates, torch.zeros((1), dtype=torch.long, device=tree_candidates.device)], dim=0)
 
@@ -189,7 +183,7 @@ def generate_candidates(candidates_logit, topk_spec_logits, tree_indices, retrie
 
 
 def create_4d_causal_mask(
-    position_ids: np.ndarray, past_seen_tokens: int, tree_mask: Optional[np.ndarray] = None
+    position_ids: np.ndarray, ctx_len: int, past_seen_tokens: Optional[int] = None, tree_mask: Optional[np.ndarray] = None
 ) -> np.ndarray:
     """
     Creates a QEff 4D mask that also integrates tree attention mask
@@ -197,6 +191,7 @@ def create_4d_causal_mask(
     Parameters:
     ----------
     position_ids (np.ndarray): position ids, shape: [decode_batch_size, seq_len]
+    ctx_len (int): model context length
     past_seen_tokens (int): number of previous tokens seen
     tree_mask (Optional[np.ndarray]): tree attention mask, shape: [1, 1, tree_len, tree_len]
 
@@ -207,15 +202,15 @@ def create_4d_causal_mask(
     """
 
     # compute target length
-    seq_len = position_ids.shape[1]
-    target_len = seq_len + past_seen_tokens
     query_indices = position_ids[:, :, np.newaxis]
-    kv_indices = np.arange(target_len).reshape(1, 1, -1)
+    kv_indices = np.arange(ctx_len).reshape(1, 1, -1)
     causal_mask = kv_indices > query_indices
-    causal_mask = causal_mask[:, np.newaxis]  # shape: [1, 1, seq_len, target_len]
+    causal_mask = causal_mask[:, np.newaxis]  # shape: [1, 1, position_ids.shape[1], ctx_len]
 
     if tree_mask is not None:
+        assert past_seen_tokens is not None
         tree_len = tree_mask.shape[-1]
-        causal_mask[:, :, :, -tree_len:] = tree_mask
+        causal_mask[:, :, :, past_seen_tokens:past_seen_tokens+tree_len] = tree_mask
+        #causal_mask[:, :, :, -tree_len:] = tree_mask
 
     return causal_mask
