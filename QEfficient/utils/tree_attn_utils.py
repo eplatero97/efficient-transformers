@@ -170,7 +170,7 @@ def generate_candidates(candidates_logit, topk_spec_logits, tree_indices, retrie
 
     # Extend the tree candidates by appending a zero.
     tree_candidates_ext = np.concatenate(
-        [tree_candidates, np.zeros((bsz, 1), dtype=np.int32)], axis=-1
+        [tree_candidates, np.zeros((bsz, 1), dtype=np.int64)], axis=-1
     )  # shape: [bsz, n_nodes+1]
     # tree_candidates_ext = torch.cat([tree_candidates, torch.zeros((1), dtype=torch.long, device=tree_candidates.device)], dim=0)
 
