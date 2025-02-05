@@ -152,6 +152,13 @@ def prepare_decode_dlm_inputs(
     Returns:
         Tuple[np.ndarray, np.ndarray]: tuple containing speculative input and positional ids of next iteration
     """
+    # debug
+#    print(f"{target_tokens=}")
+#    print(f"{target_pids=}")
+#    print(f"{valid_greedy_spec_tokens=}")
+#    print(f"{valid_best_path_indices=}")
+#    print(f"{greedy_candidate_idx=}")
+#    print(f"{valid_num_tokens_selected=}")
     # determine whether greedy candidate was chosen
     decode_batch_size, target_len = target_tokens.shape # shape: [decode_batch_size, num_speculative_tokens+1]
     all_are_greedy_candidate = (greedy_candidate_idx == valid_best_path_indices).all()
@@ -174,7 +181,8 @@ def prepare_decode_dlm_inputs(
     dlm_iids = target_tokens[:, min_num_tokens_selected:max_num_tokens_selected+1] 
     # create left padded positional ids
     pids_mask = np.ones((decode_batch_size, target_len), dtype=np.int64)
-    pids_mask[valid_batch_indices, valid_num_tokens_selected-1] = 0
+    #pids_mask[valid_batch_indices, valid_num_tokens_selected-1] = 0 # TODO: something wrong here
+    pids_mask[valid_batch_indices, accept_lengths] = 0 # TODO: something wrong here
     pids_mask = np.cumprod(pids_mask, axis=1)
     dlm_pids = np.where(pids_mask, -1, target_pids)[:, min_num_tokens_selected:max_num_tokens_selected+1]
     assert dlm_iids.shape == dlm_pids.shape
@@ -380,6 +388,7 @@ def tree_attn_inference(
     full_batch_size: Optional[int],
     device_group: List[int] = [0],
     sessions: Optional[Tuple[QAICInferenceSession, QAICInferenceSession]] = None,
+    ignore_eos_token: bool = True,
 ):
     num_tree_nodes = len(tree_attn_choices)+1 # +1 to account for root node
     # assumes dlm and tlm are compiled to the same prompt-chunk-size, context length and full_batch_size/batch-size
@@ -519,6 +528,8 @@ def tree_attn_inference(
     freq = np.zeros_like(retrieve_indices, dtype=np.int64) 
     # start decode phase
     valid_batch_indices = np.full(decode_batch_size, True, dtype=bool)
+    if not ignore_eos_token:
+        valid_batch_indices[dlm_decode_inputs["input_ids"][:,0] == tokenizer.eos_token_id] = False
     it = 0
     mean_num_accepted_tokens = 0
     am = np.ones((decode_batch_size, num_tree_nodes))
@@ -531,6 +542,7 @@ def tree_attn_inference(
         # generate proposals from draft model
         common_token_id: np.ndarray = dlm_decode_inputs["input_ids"][:, -1:].copy() # shape: [decode_batch_size, 1]
         common_position_id: np.ndarray = dlm_decode_inputs["position_ids"][:, -1:].copy() # shape: [decode_batch_size, 1]
+        #print(f"{common_position_id=}")
         #print("dlm_decode_inputs=")
         #pprint(dlm_decode_inputs)
         speculate_tokens( 
@@ -549,6 +561,7 @@ def tree_attn_inference(
         #print(f"{spec_tree_candidates=}")
         # prepare TLM inputs
         past_seen_values: int = common_position_id.max()
+        #print(f"{past_seen_values=}")
         # continue
         #print(f"{past_seen_values=}") # 24
         tlm_precode_inputs["input_ids"][:] = spec_tree_candidates
@@ -585,9 +598,10 @@ def tree_attn_inference(
             # record accepted tokens
             num_gen_tokens_left = max_gen_len[bi] - len(generated_ids[bi])
             num_tokens_to_append = min(num_accepted_tokens, num_gen_tokens_left)
-            accepted_tokens = target_tokens[bi, :num_tokens_to_append].tolist()
+            accepted_tokens_arr = target_tokens[bi, :num_tokens_to_append]
+            accepted_tokens = accepted_tokens_arr.tolist()
             generated_ids[bi].extend(accepted_tokens)
-            if len(generated_ids[bi])+num_tree_nodes >= max_gen_len[bi]:
+            if len(generated_ids[bi])+num_tree_nodes >= max_gen_len[bi] or ((not ignore_eos_token) and (accepted_tokens_arr == tokenizer.eos_token_id).any()):
                 valid_batch_indices[bi] = False
         # check if all generations are done
         if not valid_batch_indices.any():
@@ -690,6 +704,7 @@ def arg_parse():
         "--device-group", type=comma_separated_ints, default="0", help="comma separated device QIDs (e.g., '1,2,3')"
     )
     parser.add_argument('--record', action='store_true')
+    parser.add_argument('--ignore_eos_token', action='store_true')
     args = parser.parse_args()
     return args
 
