@@ -338,6 +338,36 @@ def kv_match(dlm_output: dict, tlm_precode_inputs: dict, past_seen_values) -> No
             dlm_kv = dlm_output[key][:, :, :past_seen_values].copy()
             tlm_precode_inputs[key.split(RS_SUFFIX)[0]][:, :, :past_seen_values] = dlm_kv
 
+def create_session(target_name, 
+                   device_group,
+                   prefill_seq_len,
+                   ctx_len,
+                   full_batch_size,
+                   is_tlm,
+                   include_4d_causal_mask,
+                   topk_logits,
+                   num_cores,
+                   num_tree_nodes = None,
+                   ):
+    # export_and_compile tlm/dlm
+    continuous_batching = full_batch_size is not None
+    model = AutoModelForCausalLM.from_pretrained(
+        target_name, continuous_batching=continuous_batching, is_tlm=is_tlm, include_4d_causal_mask=include_4d_causal_mask, topk_logits=topk_logits
+    )
+    num_devices = len(device_group)
+    qpc_path: str = model.compile(
+        num_cores=num_cores,
+        num_devices=num_devices,
+        prefill_seq_len=prefill_seq_len,
+        ctx_len=ctx_len,
+        aic_enable_depth_first=True,
+        full_batch_size=full_batch_size,
+        num_speculative_tokens=None if num_tree_nodes is None else num_tree_nodes-1,
+    )
+    # init qaic session
+    session = QAICInferenceSession(qpc_path, device_ids=device_group)
+    return session
+
 def tree_attn_inference(
     prompts: List[str],
     tree_attn_choices: List[list],
@@ -349,6 +379,7 @@ def tree_attn_inference(
     target_model_name: str,
     full_batch_size: Optional[int],
     device_group: List[int] = [0],
+    sessions: Optional[Tuple[QAICInferenceSession, QAICInferenceSession]] = None,
 ):
     num_tree_nodes = len(tree_attn_choices)+1 # +1 to account for root node
     # assumes dlm and tlm are compiled to the same prompt-chunk-size, context length and full_batch_size/batch-size
@@ -359,32 +390,30 @@ def tree_attn_inference(
     vocab_size = len(tokenizer)
 
     # export_and_compile tlm/dlm
-    continuous_batching = full_batch_size is not None
-    target_model = AutoModelForCausalLM.from_pretrained(
-        target_model_name, continuous_batching=continuous_batching, is_tlm=True, include_4d_causal_mask=True, topk_logits=1
-    )
-    draft_model = AutoModelForCausalLM.from_pretrained(draft_model_name, continuous_batching=continuous_batching, topk_logits=TOPK)
-
-    num_devices = len(device_group)
-    target_model_qpc_path: str = target_model.compile(
-        num_cores=11,
-        num_devices=num_devices,
-        prefill_seq_len=prefill_seq_len,
-        ctx_len=ctx_len,
-        aic_enable_depth_first=True,
-        full_batch_size=full_batch_size,
-        num_speculative_tokens=num_tree_nodes-1,
-    )
-    draft_model_qpc_path: str = draft_model.compile(
-        num_cores=5,
-        prefill_seq_len=prefill_seq_len,
-        ctx_len=ctx_len,
-        aic_enable_depth_first=True,
-        full_batch_size=full_batch_size,
-    )
-    # init qaic session
-    target_model_session = QAICInferenceSession(target_model_qpc_path, device_ids=device_group)
-    draft_model_session = QAICInferenceSession(draft_model_qpc_path, device_ids=device_group)
+    if sessions is None:
+        target_model_session = create_session(
+            target_name=target_model_name,
+            device_group=device_group,
+            prefill_seq_len=prefill_seq_len,
+            ctx_len=ctx_len,
+            full_batch_size=full_batch_size,
+            is_tlm=True,
+            include_4d_causal_mask=True,
+            topk_logits=1,
+            num_cores=11,
+            num_tree_nodes=num_tree_nodes
+        )
+        draft_model_session = create_session(
+            target_name=draft_model_name,
+            device_group=device_group,
+            prefill_seq_len=prefill_seq_len,
+            ctx_len=ctx_len,
+            full_batch_size=full_batch_size,
+            is_tlm=False,
+            include_4d_causal_mask=False,
+            topk_logits=TOPK,
+            num_cores=5,
+        )
 
     # skip past key/value buffers
     target_model_session.skip_buffers(set([x for x in target_model_session.input_names if x.startswith("past_")]))
@@ -435,9 +464,9 @@ def tree_attn_inference(
     tree_position_ids = tree_buffers["medusa_position_ids"].numpy().reshape(1, -1).astype(np.int64) # shape: [1, num_tree_nodes]
     retrieve_indices = tree_buffers["retrieve_indices"].numpy().astype(np.int64) # shape: [leaf_nodes, num_speculative_tokens+1]
     greedy_candidate_idx = retrieve_indices.sum(axis=1).argmin().item() # shape: [1]
-    print(f"{tree_mask.astype(int)=}")
-    print(f"{retrieve_indices=}")
-    print(f"{greedy_candidate_idx=}")
+    #print(f"{tree_mask.astype(int)=}")
+    #print(f"{retrieve_indices=}")
+    #print(f"{greedy_candidate_idx=}")
     # set prefill logits buffers
     tlm_prefill_logits = np.zeros((prefill_bsz, 1, 1), dtype=np.int64)
     spec_prefill_logits = np.zeros((prefill_bsz, 1, TOPK), dtype=np.int64)
@@ -495,13 +524,13 @@ def tree_attn_inference(
     decode_start = perf_counter()
     while True:
         it += 1
-        print('-'*60)
-        print(f"{it=}")
+        #print('-'*60)
+        #print(f"{it=}")
         # generate proposals from draft model
         common_token_id: np.ndarray = dlm_decode_inputs["input_ids"][:, -1:].copy() # shape: [decode_batch_size, 1]
         common_position_id: np.ndarray = dlm_decode_inputs["position_ids"][:, -1:].copy() # shape: [decode_batch_size, 1]
-        print("dlm_decode_inputs=")
-        pprint(dlm_decode_inputs)
+        #print("dlm_decode_inputs=")
+        #pprint(dlm_decode_inputs)
         speculate_tokens( 
             draft_model_session, 
             dlm_decode_inputs, 
@@ -509,42 +538,38 @@ def tree_attn_inference(
             num_speculative_tokens, 
             spec_decode_nst_topk) # shape: [decode_batch_size, num_speculative_tokens, TOPK]
         # generate speculative tree proposals
-        spec_decode_nst_topk = np.zeros((decode_batch_size, num_speculative_tokens, TOPK), dtype=np.int64)
         (spec_candidates, # shape: [decode_batch_size, leaf_nodes, num_speculative_tokens+1]
         spec_tree_candidates # shape: [decode_batch_size, num_tree_nodes]
         ) = generate_candidates(common_token_id, spec_decode_nst_topk, tree_indices, retrieve_indices)
         assert spec_candidates.shape[1:] == retrieve_indices.shape
         assert spec_tree_candidates.shape[1] == tree_position_ids.shape[1]
-        print(f"{spec_candidates=}")
-        print(f"{spec_tree_candidates=}")
+        #print(f"{spec_candidates=}")
+        #print(f"{spec_tree_candidates=}")
         # prepare TLM inputs
         past_seen_values: int = common_position_id.max()
         # continue
-        print(f"{past_seen_values=}") # 24
+        #print(f"{past_seen_values=}") # 24
         tlm_precode_inputs["input_ids"][:] = spec_tree_candidates
         tlm_pids = tlm_precode_inputs["position_ids"]
         causal_mask = create_4d_causal_mask(tlm_pids, ctx_len, past_seen_values, tree_mask) # shape: [decode_batch_size, 1, num_tree_nodes, ctx_len] TODO: generalize to bsz > 1
-        if it == 3:
-            print("causal_mask")
-            pprint(causal_mask.astype(int))
         tlm_precode_inputs["attention_mask"] = causal_mask
         # run TLM inferences
-        print(f"{tlm_precode_inputs['input_ids']=}")
-        print(f"{tlm_precode_inputs['position_ids']=}")
+        #print(f"{tlm_precode_inputs['input_ids']=}")
+        #print(f"{tlm_precode_inputs['position_ids']=}")
         tlm_outputs: dict = target_model_session.run(tlm_precode_inputs) 
         target_logits: np.ndarray = tlm_outputs["logits"] # shape: [decode_batch_size, num_tree_nodes, 1]
-        print(f"{target_logits=}")
+        #print(f"{target_logits=}")
         tlm_candidates = target_logits[:, retrieve_indices, 0] # shape: [decode_batch_size, leaf_nodes, num_speculative_tokens+1]
         assert tlm_candidates.shape[1:] == retrieve_indices.shape
-        print(f"{tlm_candidates=}")
+        #print(f"{tlm_candidates=}")
         # select best tlm/spec pair of candidates
         (target_tokens, # shape: [decode_batch_size, num_speculative_tokens+1]
          spec_tokens, # shape: [decode_batch_size, num_speculative_tokens+1]
          num_tokens_selected, # shape: [decode_batch_size]
          best_path_indices, # shape: [decode_batch_size]
           ) = select_best_candidates(spec_candidates, tlm_candidates)
-        print(f"{num_tokens_selected=}")
-        print(f"{best_path_indices=}")
+        #print(f"{num_tokens_selected=}")
+        #print(f"{best_path_indices=}")
         # record mean number of accepted tokens
         mean_num_accepted_tokens += num_tokens_selected[valid_batch_indices].mean().item()
         # append selected tokens to the generated_ids
@@ -651,10 +676,12 @@ def arg_parse():
     parser.add_argument("--ctx-len", type=int, default=32, help="Context length")
     parser.add_argument("--prefill-bsz", type=int, default=1, help="Prefill batch size")
     parser.add_argument(
-        "--draft-model-name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0", help="Draft model name"
+        #"--draft-model-name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0", help="Draft model name"
+        "--draft-model-name", type=str, default="JackFram/llama-68m", help="Draft model name"
     )
     parser.add_argument(
-        "--target-model-name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0", help="Target model name"
+        #"--target-model-name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0", help="Target model name"
+        "--target-model-name", type=str, default="JackFram/llama-160m", help="Target model name"
     )
     parser.add_argument("--full-batch-size", type=optional_int, default=None, help="Full batch size")
     parser.add_argument(
@@ -663,6 +690,7 @@ def arg_parse():
     parser.add_argument('--record', action='store_true')
     args = parser.parse_args()
     return args
+
 
 def main():
     args = arg_parse()
@@ -677,10 +705,12 @@ def main():
     if not record:
         return
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = '_'.join(f'{k}_{v}' for k, v in args.items())
-    filename = f"{timestamp}_draft_tree_inference_{fname}.pkl"
+    #fname = '_'.join(f'{k}_{v}' for k, v in args.items())
+    #filename = f"{timestamp}_draft_tree_inference_{fname}.pkl"
+    filename = f"{timestamp}_draft_tree_inference.pkl"
     with open(filename, 'wb') as f:
         pickle.dump(exec_info, f)
+    print(f"pickle file: {filename}")
     
 
 
