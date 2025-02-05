@@ -414,6 +414,8 @@ def tree_attn_inference(
             topk_logits=TOPK,
             num_cores=5,
         )
+    else:
+        target_model_session, draft_model_session = sessions
 
     # skip past key/value buffers
     target_model_session.skip_buffers(set([x for x in target_model_session.input_names if x.startswith("past_")]))
