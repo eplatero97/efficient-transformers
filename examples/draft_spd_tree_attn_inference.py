@@ -136,7 +136,8 @@ def prepare_decode_dlm_inputs(
     valid_best_path_indices: np.ndarray, 
     greedy_candidate_idx: int, 
     valid_num_tokens_selected: np.ndarray, 
-    valid_batch_indices: np.ndarray
+    valid_batch_indices: np.ndarray,
+    debug=False,
     ) -> Tuple[np.ndarray, np.ndarray]:
     """prepare decode dlm inputs for next iteration
 
@@ -153,18 +154,19 @@ def prepare_decode_dlm_inputs(
         Tuple[np.ndarray, np.ndarray]: tuple containing speculative input and positional ids of next iteration
     """
     # debug
-#    print(f"{target_tokens=}")
-#    print(f"{target_pids=}")
-#    print(f"{valid_greedy_spec_tokens=}")
-#    print(f"{valid_best_path_indices=}")
-#    print(f"{greedy_candidate_idx=}")
-#    print(f"{valid_num_tokens_selected=}")
+    if debug:
+        print(f"{target_tokens=}")
+        print(f"{target_pids=}")
+        print(f"{valid_greedy_spec_tokens=}")
+        print(f"{valid_best_path_indices=}")
+        print(f"{greedy_candidate_idx=}")
+        print(f"{valid_num_tokens_selected=}")
     # determine whether greedy candidate was chosen
     decode_batch_size, target_len = target_tokens.shape # shape: [decode_batch_size, num_speculative_tokens+1]
     all_are_greedy_candidate = (greedy_candidate_idx == valid_best_path_indices).all()
+    max_num_tokens_selected = valid_num_tokens_selected.max()
     if all_are_greedy_candidate:
         min_num_tokens_selected = valid_num_tokens_selected.min()
-        max_num_tokens_selected = valid_num_tokens_selected.max()
         if min_num_tokens_selected == target_len:
             # all tokens were accepted, pack last two tokens
             dlm_iids = target_tokens[:, -2:]
@@ -175,17 +177,22 @@ def prepare_decode_dlm_inputs(
         posterior_mask = target_tokens[valid_batch_indices, :-1] == valid_greedy_spec_tokens[valid_batch_indices] # shape: [num_valid_batch_indices, num_speculative_tokens]
         accept_lengths = np.cumprod(posterior_mask, axis=1).sum(axis=1) # shape: [num_valid_batch_indices]
         min_num_tokens_selected = accept_lengths.min()
-        max_num_tokens_selected = accept_lengths.max()
     assert min_num_tokens_selected >= 0
     #dlm_iids = target_tokens[:, min_num_tokens_selected-1:] 
-    dlm_iids = target_tokens[:, min_num_tokens_selected:max_num_tokens_selected+1] 
+    #dlm_iids = target_tokens[:, min_num_tokens_selected:max_num_tokens_selected+1] 
+    # TODO: generalize to bsz>1
+    dlm_iids = target_tokens[:, min_num_tokens_selected:max_num_tokens_selected] 
     # create left padded positional ids
     pids_mask = np.ones((decode_batch_size, target_len), dtype=np.int64)
     #pids_mask[valid_batch_indices, valid_num_tokens_selected-1] = 0 # TODO: something wrong here
     pids_mask[valid_batch_indices, accept_lengths] = 0 # TODO: something wrong here
     pids_mask = np.cumprod(pids_mask, axis=1)
-    dlm_pids = np.where(pids_mask, -1, target_pids)[:, min_num_tokens_selected:max_num_tokens_selected+1]
+    #dlm_pids = np.where(pids_mask, -1, target_pids)[:, min_num_tokens_selected:max_num_tokens_selected+1]
+    dlm_pids = np.where(pids_mask, -1, target_pids)[:, min_num_tokens_selected:max_num_tokens_selected]
     assert dlm_iids.shape == dlm_pids.shape
+    if debug:
+        print(f"{dlm_iids=}")
+        print(f"{dlm_pids=}")
     return dlm_iids, dlm_pids
 
 def mv_retainedstate_buffers_to_decode_input(tlm_outputs: dict, tlm_precode_inputs: dict) -> None:
@@ -275,7 +282,7 @@ def split_dlm_bonus_token_inputs(dlm_decode_inputs: dict) -> List[dict]:
 
     return inputs
 
-def speculate_tokens(draft_model_session, dlm_decode_inputs, valid_batch_indices, num_speculative_tokens, spec_decode_nst_topk):
+def speculate_tokens(draft_model_session, dlm_decode_inputs, valid_batch_indices, num_speculative_tokens, spec_decode_nst_topk, debug = False):
     seq_len = dlm_decode_inputs["input_ids"].shape[1]
     has_catchup_tokens = (seq_len > 1)
     for k_ in range(num_speculative_tokens):
@@ -294,6 +301,8 @@ def speculate_tokens(draft_model_session, dlm_decode_inputs, valid_batch_indices
         input_ids = dlm_logits[:, :, 0] # shape: [decode_batch_size, 1]
         dlm_decode_inputs["input_ids"] = input_ids
         dlm_decode_inputs["position_ids"][valid_batch_indices] += 1
+    if debug:
+        return dlm_outputs
 
 def select_best_candidates(
         spec_candidates: np.ndarray,
@@ -389,6 +398,7 @@ def tree_attn_inference(
     device_group: List[int] = [0],
     sessions: Optional[Tuple[QAICInferenceSession, QAICInferenceSession]] = None,
     ignore_eos_token: bool = True,
+    debug: bool = False
 ):
     num_tree_nodes = len(tree_attn_choices)+1 # +1 to account for root node
     # assumes dlm and tlm are compiled to the same prompt-chunk-size, context length and full_batch_size/batch-size
@@ -506,6 +516,8 @@ def tree_attn_inference(
         dlm_decode_inputs["position_ids"][bi, 0] = input_len
         tlm_precode_inputs["position_ids"][bi] = tree_position_ids[0] + input_len
         # assumes that prefill queue will always be popped from the front
+        if debug:
+            print(f"{input_len=}")
         input_lengths[bi] = input_len
         max_gen_len[bi] -= input_lengths[bi]
     batch_ttft = perf_counter() - e2e_start
@@ -521,9 +533,10 @@ def tree_attn_inference(
     target_model_session.unskip_buffers(
         set([x for x in target_model_session.output_names if x.endswith(RS_SUFFIX)])
     )
-    draft_model_session.unskip_buffers(
-        set([x for x in draft_model_session.output_names if x.endswith(RS_SUFFIX)])
-    )
+    if debug:
+        draft_model_session.unskip_buffers(
+            set([x for x in draft_model_session.output_names if x.endswith(RS_SUFFIX)])
+        )
     # create frequency matrix to track number of accepted tokens with each respective candidate
     freq = np.zeros_like(retrieve_indices, dtype=np.int64) 
     # start decode phase
@@ -537,20 +550,30 @@ def tree_attn_inference(
     decode_start = perf_counter()
     while True:
         it += 1
-        #print('-'*60)
-        #print(f"{it=}")
+        if debug:
+            print('-'*60)
+            print(f"{it=}")
         # generate proposals from draft model
         common_token_id: np.ndarray = dlm_decode_inputs["input_ids"][:, -1:].copy() # shape: [decode_batch_size, 1]
         common_position_id: np.ndarray = dlm_decode_inputs["position_ids"][:, -1:].copy() # shape: [decode_batch_size, 1]
         #print(f"{common_position_id=}")
         #print("dlm_decode_inputs=")
         #pprint(dlm_decode_inputs)
-        speculate_tokens( 
-            draft_model_session, 
-            dlm_decode_inputs, 
-            valid_batch_indices, 
-            num_speculative_tokens, 
-            spec_decode_nst_topk) # shape: [decode_batch_size, num_speculative_tokens, TOPK]
+        if debug:
+            dlm_output = speculate_tokens( 
+                draft_model_session, 
+                dlm_decode_inputs, 
+                valid_batch_indices, 
+                num_speculative_tokens, 
+                spec_decode_nst_topk,
+                debug) # shape: [decode_batch_size, num_speculative_tokens, TOPK]
+        else:
+            speculate_tokens( 
+                draft_model_session, 
+                dlm_decode_inputs, 
+                valid_batch_indices, 
+                num_speculative_tokens, 
+                spec_decode_nst_topk) # shape: [decode_batch_size, num_speculative_tokens, TOPK]
         # generate speculative tree proposals
         (spec_candidates, # shape: [decode_batch_size, leaf_nodes, num_speculative_tokens+1]
         spec_tree_candidates # shape: [decode_batch_size, num_tree_nodes]
@@ -569,22 +592,26 @@ def tree_attn_inference(
         causal_mask = create_4d_causal_mask(tlm_pids, ctx_len, past_seen_values, tree_mask) # shape: [decode_batch_size, 1, num_tree_nodes, ctx_len] TODO: generalize to bsz > 1
         tlm_precode_inputs["attention_mask"] = causal_mask
         # run TLM inferences
-        #print(f"{tlm_precode_inputs['input_ids']=}")
-        #print(f"{tlm_precode_inputs['position_ids']=}")
+        if debug:
+            print(f"{tlm_precode_inputs['input_ids']=}")
+            print(f"{tlm_precode_inputs['position_ids']=}")
         tlm_outputs: dict = target_model_session.run(tlm_precode_inputs) 
         target_logits: np.ndarray = tlm_outputs["logits"] # shape: [decode_batch_size, num_tree_nodes, 1]
         #print(f"{target_logits=}")
         tlm_candidates = target_logits[:, retrieve_indices, 0] # shape: [decode_batch_size, leaf_nodes, num_speculative_tokens+1]
         assert tlm_candidates.shape[1:] == retrieve_indices.shape
-        #print(f"{tlm_candidates=}")
+        if debug:
+            print(f"{tlm_candidates=}")
+            print(f"{spec_candidates=}")
         # select best tlm/spec pair of candidates
         (target_tokens, # shape: [decode_batch_size, num_speculative_tokens+1]
          spec_tokens, # shape: [decode_batch_size, num_speculative_tokens+1]
          num_tokens_selected, # shape: [decode_batch_size]
          best_path_indices, # shape: [decode_batch_size]
           ) = select_best_candidates(spec_candidates, tlm_candidates)
-        #print(f"{num_tokens_selected=}")
-        #print(f"{best_path_indices=}")
+        if debug:
+            print(f"{num_tokens_selected=}")
+            print(f"{best_path_indices=}")
         # record mean number of accepted tokens
         mean_num_accepted_tokens += num_tokens_selected[valid_batch_indices].mean().item()
         # append selected tokens to the generated_ids
@@ -601,6 +628,9 @@ def tree_attn_inference(
             accepted_tokens_arr = target_tokens[bi, :num_tokens_to_append]
             accepted_tokens = accepted_tokens_arr.tolist()
             generated_ids[bi].extend(accepted_tokens)
+            if debug:
+                print(f"{accepted_tokens=}")
+                print(f"{generated_ids=}")
             if len(generated_ids[bi])+num_tree_nodes >= max_gen_len[bi] or ((not ignore_eos_token) and (accepted_tokens_arr == tokenizer.eos_token_id).any()):
                 valid_batch_indices[bi] = False
         # check if all generations are done
@@ -632,13 +662,21 @@ def tree_attn_inference(
             valid_best_path_indices,
             greedy_candidate_idx,
             valid_num_tokens_selected,
-            valid_batch_indices
+            valid_batch_indices,
+            debug
         )
+        if debug:
+            print(f"{dlm_iids=}")
+            print(f"{dlm_pids=}")
         dlm_decode_inputs["input_ids"] = dlm_iids
         dlm_decode_inputs["position_ids"] = dlm_pids
         # prepare tlm decode inputs for next iteration
         tlm_precode_inputs["position_ids"][valid_batch_indices == False] -1
         tlm_precode_inputs["position_ids"][valid_batch_indices] += valid_num_tokens_selected
+        #if it >= 315:
+        #    breakpoint()
+        #if 1135 in tlm_precode_inputs["position_ids"]:
+        #    breakpoint()
     end = perf_counter()
     decode_end = end - decode_start
     e2e_end = end - e2e_start
@@ -672,6 +710,15 @@ def tree_attn_inference(
         target_model_name,
         full_batch_size,
     )
+    if debug:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        #fname = '_'.join(f'{k}_{v}' for k, v in args.items())
+        #filename = f"{timestamp}_draft_tree_inference_{fname}.pkl"
+        filename = f"{timestamp}_draft_tree_inference_final_kv.pkl"
+        with open(filename, 'wb') as f:
+            pickle.dump(tlm_outputs, f)
+        print(f"kv$ pickle: {filename}")
+
     return exec_info
 
 def optional_int(x):
@@ -705,6 +752,7 @@ def arg_parse():
     )
     parser.add_argument('--record', action='store_true')
     parser.add_argument('--ignore_eos_token', action='store_true')
+    parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
     return args
 
