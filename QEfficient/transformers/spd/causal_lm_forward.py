@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from QEfficient.transformers.cache_utils import QEffDynamicCache
 
 def filter_hidden_states(
     hidden_states: torch.Tensor,
@@ -49,6 +50,31 @@ def filter_hidden_states(
     hidden_states = torch.gather(hidden_states, dim=1, index=indices)  # shape: [bsz, k, d_model]
     return hidden_states
 
+def select_best_candidates(spec_candidates: torch.Tensor, target_candidates: torch.Tensor):
+    bsz = spec_candidates.size(0)
+    num_speculative_tokens = spec_candidates.size(2)-1
+    batch_indices = torch.arange(bsz)
+    posterior_mask = spec_candidates[:, :, 1:] == target_candidates[:, :, :num_speculative_tokens] # shape: [decode_batch_size, leaf_nodes, num_speculative_tokens]
+    #candidates_accept_length = torch.cumprod(posterior_mask, dim=2).sum(dim=2) # cumprod op not supported by onnx, shape: [decode_batch_size, leaf_nodes]
+    #min_indices = torch.argmin(posterior_mask.to(torch.int64), dim=2) # not supported by qaic optimization, shape: [decode_batch_size, leaf_nodes]
+    #min_indices[(min_indices==0) & (posterior_mask.sum(dim=2)==num_speculative_tokens)] = num_speculative_tokens
+    #candidates_accept_length = min_indices
+    cumsum_mask = posterior_mask.to(torch.int64).cumsum(dim=2) == (torch.arange(num_speculative_tokens, dtype=torch.int64)+1)
+    candidates_accept_length = cumsum_mask.sum(dim=2)
+    num_tokens_selected = candidates_accept_length.max(dim=1).values + 1 # shape: [deode_batch_size]
+    best_path_indices = torch.argmax(candidates_accept_length, dim=1) # shape: [decode_batch_size]
+    best_tlm_paths = target_candidates[batch_indices, best_path_indices, :] # target_tokens, shape: [decode_batch_size, num_speculative_tokens+1]
+    return best_tlm_paths, best_path_indices, num_tokens_selected, 
+
+def generate_sequential_and_dispersed_pids(position_ids, retrieve_best_indices):
+    bsz, n_nodes = position_ids.size()
+    num_speculative_tokens = retrieve_best_indices.size(1) - 1 
+    root_pids = position_ids[:, 0] # shape: [decode_batch_size]
+    tree_seq_pids = torch.arange(1, n_nodes, dtype=torch.int32).view(1,-1).repeat(bsz, 1) + root_pids # shape: [decode_batch_size, n_nodes-1]
+    aligned_pids = tree_seq_pids[:, :num_speculative_tokens] # ctx_len indices that will be updated, shape: [decode_batch_size, num_speculative_tokens]
+    no_root_best_indices = retrieve_best_indices[:, 1:] - 1 # retrieve only non-root indices, shape: [decode_batch_size, num_speculative_tokens]
+    dispersed_pids = torch.gather(tree_seq_pids, 1, no_root_best_indices) # ctx_len indices that will be extracted, shape: [decode_batch_size, num_speculative_tokens]
+    return aligned_pids, dispersed_pids
 
 def tlm_forward(
     self,
@@ -65,6 +91,7 @@ def tlm_forward(
     return_dict: Optional[bool] = None,
     cache_position: Optional[torch.LongTensor] = None,
     num_logits_to_keep: Optional[torch.LongTensor] = None,
+    retrieve_indices: Optional[torch.LongTensor] = None,
 ) -> Union[Tuple, CausalLMOutputWithPast]:
     r"""
     Args:
@@ -96,6 +123,7 @@ def tlm_forward(
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
     )
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+    print(f"{position_ids=}")
 
     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
     outputs = self.model(
@@ -123,9 +151,51 @@ def tlm_forward(
     topk_logits: Optional[int] = getattr(self, "topk_logits", None)
     if topk_logits:
         if topk_logits == 1:
-            logits = logits.argmax(dim=2, keepdim=True)
+            logits: torch.LongTensor = logits.argmax(dim=2, keepdim=True)
         else:
-            logits = logits.topk(k=topk_logits, dim=2).indices
+            logits: torch.LongTensor = logits.topk(k=topk_logits, dim=2).indices
+    if retrieve_indices is not None:
+        assert hasattr(position_ids, "is_tree") and position_ids.is_tree, f"position ids has no `is_tree` attribute or it's False"
+        if isinstance(past_key_values, (list, tuple)):
+            past_key_values = QEffDynamicCache.from_legacy_cache(past_key_values)
+        if topk_logits is None:
+            # extract candidates
+            target_tree_tokens = logits.argmax(dim=2, keepdim=True)
+        else:
+            target_tree_tokens = logits[:, :, 0:1]
+        target_candidates = target_tree_tokens[:, retrieve_indices, 0] # shape: [bsz, *retrieve_indices.size()]
+        spec_candidates = input_ids[:, retrieve_indices] # shape: [bsz, *retrieve_indices.size()]
+        print(f"{target_tree_tokens=}")
+        print(f"{target_candidates=}")
+        print(f"{spec_candidates=}")
+        # select best candidate
+        (best_tlm_paths, # shape: [bsz, num_speculative_tokens+1]
+            best_path_indices, # shape: [bsz]
+            num_tokens_selected, # shape: [bsz]
+            ) = select_best_candidates(spec_candidates, target_candidates)
+        retrieve_best_indices = retrieve_indices[best_path_indices] # shape: [bsz, num_speculative_tokens+1]
+        print(f"{num_tokens_selected=}")
+        print(f"{best_path_indices=}")
+        print(f"{retrieve_best_indices=}")
+        # generate sequential and dispersed pids
+        #position_ids = position_ids.to(torch.int32)
+        #retrieve_best_indices = retrieve_best_indices.to(torch.int32) # gather expects dtype int64 for index
+        aligned_pids, dispersed_pids = generate_sequential_and_dispersed_pids(position_ids, retrieve_best_indices)
+        print(f"{aligned_pids=}")
+        print(f"{dispersed_pids=}")
+        #aligned_pids = aligned_pids.to(torch.int32)
+        #dispersed_pids = dispersed_pids.to(torch.int32)
+        # align kv$
+        cache_kwargs = {"batch_index": batch_index}
+        for decode_layer_idx in range(len(self.model.layers)):
+            past_key_values.align(
+                dispersed_pids, 
+                aligned_pids, 
+                decode_layer_idx,
+                cache_kwargs)
+        # prepare output variables
+        logits = torch.cat([best_tlm_paths, num_tokens_selected.view(-1,1), best_path_indices.view(-1,1)], dim=1)
+        past_key_values = past_key_values.to_legacy_cache()
 
     return CausalLMOutputWithPast(
         loss=None,

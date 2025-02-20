@@ -233,6 +233,12 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
                 2: "seq_len", 
                 3: "ctx_len"
             }
+            nlk = constants.ONNX_EXPORT_EXAMPLE_NLK  # Number of Logits to Keep
+            example_inputs["retrieve_indices"] = torch.ones((bs,nlk), dtype=torch.int64)
+            dynamic_axes["retrieve_indices"] = {
+                0: "num_leaf_nodes",
+                1: "tree_len"
+            }
         if len(kv_cache_shape) == 3:  # For GPTBigCode arch the pkv is 3d
             pkv_dynamic_axes = {
                 0: "full_batch_size" if self.continuous_batching else "batch_size",
@@ -280,6 +286,8 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         mxfp6_matmul: bool = False,
         mxint8_kv_cache: bool = False,
         num_speculative_tokens: Optional[int] = None,
+        num_leaf_nodes: Optional[int] = None,
+        tree_len: Optional[int] = None,
         **compiler_options,
     ) -> str:
         """
@@ -318,6 +326,8 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
 #                raise ValueError(
 #                    f"sequence length ({prefill_seq_len}) must be at least `num_speculative_tokens+1` ({num_logits_to_keep})"
 #                )
+            if num_leaf_nodes is not None:
+                assert self.include_4d_causal_mask and isinstance(num_leaf_nodes, int)
 
         if self.continuous_batching and full_batch_size is None:
             raise TypeError("missing required argument: 'full_batch_size'")
@@ -345,6 +355,14 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
             decode_specialization.update({"full_batch_size": full_batch_size}) if self.continuous_batching else None
             decode_specialization.update({"num_logits_to_keep": num_speculative_tokens + 1}) if self.is_tlm else None
             specializations.append(decode_specialization)
+
+        if num_leaf_nodes is not None:
+            assert tree_len is not None and isinstance(tree_len, int)
+            specializations[0]["num_leaf_nodes"] = 1
+            specializations[0]["num_logits_to_keep"] = 2
+            specializations[0]["tree_len"] = 2
+            specializations[1]["num_leaf_nodes"] = num_leaf_nodes
+            specializations[1]["tree_len"] = tree_len
 
         # Custom IO
         custom_io = {}
@@ -398,6 +416,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
                 tokenizer,
                 self.qpc_path,
                 prompt=prompts,
+                stream=False,
                 device_id=device_id,
                 generation_len=generation_len,
                 is_tlm=self.is_tlm,

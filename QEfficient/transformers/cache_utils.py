@@ -188,3 +188,57 @@ class QEffDynamicCache(DynamicCache):
             v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
 
         return k_out, v_out
+
+
+    def align(
+        self,
+        dispersed_pids,
+        aligned_pids,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
+
+        Parameters:
+            key_states (`torch.Tensor`):
+                The new key states to cache.
+            value_states (`torch.Tensor`):
+                The new value states to cache.
+            layer_idx (`int`):
+                The index of the layer to cache the states for.
+            cache_kwargs (`Dict[str, Any]`, `optional`):
+                Additional arguments for the cache subclass. No additional arguments are used in `DynamicCache`.
+
+        Return:
+            A tuple containing the updated key and value states.
+        """
+        batch_index = cache_kwargs.get("batch_index", None)  # Check and fetch batch index value form the kwargs
+        # Gather
+        kv_indices = dispersed_pids.unsqueeze(1).to(torch.int64) # shape: [bsz, 1, num_speculative_tokens+1]
+        if batch_index is not None:
+            k_out = CtxGatherFuncCB.apply(self.key_cache[layer_idx], batch_index, kv_indices)
+            v_out = CtxGatherFuncCB.apply(self.value_cache[layer_idx], batch_index, kv_indices)
+        else:
+            k_out = CtxGatherFunc.apply(self.key_cache[layer_idx], kv_indices)
+            v_out = CtxGatherFunc.apply(self.value_cache[layer_idx], kv_indices)
+        #v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
+
+        # Scatter
+#        if batch_index is not None:
+#            invalid_scatter_index = torch.iinfo(torch.int32).max
+#            scatter_position_ids = torch.where(position_ids < 0, invalid_scatter_index, position_ids)
+#
+#            self.key_cache[layer_idx] = CtxScatterFuncCB.apply(
+#                self.key_cache[layer_idx], batch_index, scatter_position_ids, key_states
+#            )
+#
+#            self.value_cache[layer_idx] = CtxScatterFuncCB.apply(
+#                self.value_cache[layer_idx], batch_index, scatter_position_ids, value_states
+#            )
+#        else:
+        aligned_pids = aligned_pids.to(torch.int64)
+        self.key_cache[layer_idx] = CtxScatterFunc.apply(self.key_cache[layer_idx], aligned_pids, k_out)
+        self.value_cache[layer_idx] = CtxScatterFunc.apply(
+            self.value_cache[layer_idx], aligned_pids, v_out
+        )
