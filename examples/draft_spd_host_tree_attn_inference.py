@@ -40,7 +40,7 @@ class PerfMetrics:
     """
 
     mean_ttft: float
-    batch_ttft: float # ttft overall time
+    batch_ttft: float
     decode_throughput: float
     e2e_throughput: float
     mean_num_accepted_tokens: float
@@ -52,6 +52,7 @@ class PerfMetrics:
     draft_time: float
     target_time: float
     post_process_time: float
+    alignment_time: float
 
 
 @dataclass
@@ -258,8 +259,9 @@ def run_prefill_on_draft_and_target(
         chunk_inputs["attention_mask"] = inputs["attention_mask"][
             :, :, cache_index[0, 0] : cache_index[0, 0] + prefill_seq_len,
         ]
+
         tlm_outputs = tlm_session.run(chunk_inputs)
-        del chunk_inputs["num_logits_to_keep"]
+        del chunk_inputs["attention_mask"]
         _ = dlm_session.run(chunk_inputs)
         cache_index += prefill_seq_len
 
@@ -307,11 +309,11 @@ def split_dlm_bonus_token_inputs(dlm_decode_inputs: dict) -> List[dict]:
 
     return inputs
 
-def speculate_tokens(draft_model_session, dlm_decode_inputs, valid_batch_indices, num_speculative_tokens, spec_decode_nst_topk, debug = False, prefill_optimization=False):
+def speculate_tokens(draft_model_session, dlm_decode_inputs, valid_batch_indices, num_speculative_tokens, spec_decode_nst_topk, debug = False):
     seq_len = dlm_decode_inputs["input_ids"].shape[1]
     has_catchup_tokens = (seq_len > 1)
     for k_ in range(num_speculative_tokens):
-        if (not prefill_optimization) and (has_catchup_tokens):
+        if has_catchup_tokens:
             # split seq_len > 1 into inputs of seq_len=1
             # workaround to avoid the incorrect precode with 3-specialized multi-batch DLM
             split_inputs: List[dict] = split_dlm_bonus_token_inputs(dlm_decode_inputs)
@@ -352,34 +354,6 @@ def select_best_candidates(
     assert best_tlm_paths.shape[1] == tlm_candidates.shape[2]
     return best_tlm_paths, best_spec_paths, max_accept_length, best_path_idx 
 
-def cosine_similarity(a,b):
-    from numpy.linalg import norm
-    a = a.flatten()
-    b = b.flatten()
-    similarity = np.dot(a,b) / (norm(a)*norm(b))
-    return similarity
-
-def kv_equality(dlm_output, tlm_precode_inputs, past_seen_values):
-        for key in dlm_output:
-            if not key.endswith(RS_SUFFIX):
-                continue
-            dlm_kv = dlm_output[key][:, :, :past_seen_values]
-            tlm_kv = tlm_precode_inputs[key.split(RS_SUFFIX)[0]][:, :, :past_seen_values]
-
-            #n_equal = (dlm_kv == tlm_kv).sum() ~ 70% on it=2, 50% on it=3
-            n_equal = np.isclose(dlm_kv, tlm_kv).sum()
-            n_elms = np.prod(dlm_kv.shape)
-            acceptance = n_equal / n_elms
-            similarity = cosine_similarity(dlm_kv, tlm_kv)
-            print(f"{key} has acceptance rate of: {acceptance}, similarity of: {similarity}")
-
-def kv_match(dlm_output: dict, tlm_precode_inputs: dict, past_seen_values) -> None:
-        for key in dlm_output:
-            if not key.endswith(RS_SUFFIX):
-                continue
-            dlm_kv = dlm_output[key][:, :, :past_seen_values].copy()
-            tlm_precode_inputs[key.split(RS_SUFFIX)[0]][:, :, :past_seen_values] = dlm_kv
-
 def create_session(target_name, 
                    device_group,
                    prefill_seq_len,
@@ -389,9 +363,7 @@ def create_session(target_name,
                    include_4d_causal_mask,
                    topk_logits,
                    num_cores,
-                   num_speculative_tokens = None,
-                   num_leaf_nodes: Optional[int] = None,
-                   tree_len: Optional[int] = None,
+                   num_tree_nodes = None,
                    ):
     # export_and_compile tlm/dlm
     continuous_batching = full_batch_size is not None
@@ -406,11 +378,8 @@ def create_session(target_name,
         ctx_len=ctx_len,
         aic_enable_depth_first=True,
         full_batch_size=full_batch_size,
-        num_speculative_tokens=None if num_speculative_tokens is None else num_speculative_tokens,
-        num_leaf_nodes=num_leaf_nodes,
-        tree_len=tree_len,
+        num_speculative_tokens=None if num_tree_nodes is None else num_tree_nodes-1,
     )
-    print(f"{qpc_path=}")
     # init qaic session
     session = QAICInferenceSession(qpc_path, device_ids=device_group)
     return session
@@ -427,8 +396,7 @@ def tree_attn_inference(
     device_group: List[int] = [0],
     sessions: Optional[Tuple[QAICInferenceSession, QAICInferenceSession]] = None,
     ignore_eos_token: bool = True,
-    debug: bool = False,
-    prefill_optimization: bool = False,
+    debug: bool = False
 ):
     num_tree_nodes = len(tree_attn_choices)+1 # +1 to account for root node
     # assumes dlm and tlm are compiled to the same prompt-chunk-size, context length and full_batch_size/batch-size
@@ -437,28 +405,6 @@ def tree_attn_inference(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     vocab_size = len(tokenizer)
-    # generate tree attention buffers
-    tree_buffers = generate_medusa_buffers(tree_attn_choices)
-    tree_mask = tree_buffers["medusa_attn_mask"].numpy().astype(bool) # shape: [1, 1, num_tree_nodes, num_tree_nodes]
-    tree_mask = ~tree_mask # invert to match QEff mask where 1 values will become large negative values
-    tree_indices = tree_buffers["tree_indices"].numpy().astype(np.int64) # shape: [1, num_tree_nodes]
-    tree_position_ids = tree_buffers["medusa_position_ids"].numpy().reshape(1, -1).astype(np.int64) # shape: [1, num_tree_nodes]
-    retrieve_indices = tree_buffers["retrieve_indices"].numpy().astype(np.int64) # shape: [leaf_nodes, num_speculative_tokens+1]
-    num_leaf_nodes = retrieve_indices.shape[0]
-    num_speculative_tokens = retrieve_indices.shape[1]-1
-    # calculate greedy candidate idx
-    greedy_candidate_idx = np.where(retrieve_indices == -1, np.inf, retrieve_indices).sum(axis=1).argmin().item()
-    if debug:
-        print(f"{num_tree_nodes=}")
-        print(f"{tree_mask.astype(int)=}")
-        print(f"{tree_mask.shape=}")
-        print(f"{tree_indices=}")
-        print(f"{tree_indices.shape=}")
-        print(f"{tree_position_ids=}")
-        print(f"{tree_position_ids.shape=}")
-        print(f"{retrieve_indices=}")
-        print(f"{retrieve_indices.shape=}")
-        print(f"{greedy_candidate_idx=}")
 
     # export_and_compile tlm/dlm
     if sessions is None:
@@ -471,29 +417,20 @@ def tree_attn_inference(
             is_tlm=True,
             include_4d_causal_mask=True,
             topk_logits=None,
+            #topk_logits=1,
             num_cores=11,
-            num_speculative_tokens=num_tree_nodes-1,
-            num_leaf_nodes=num_leaf_nodes,
-            tree_len=num_speculative_tokens+1,
+            num_tree_nodes=num_tree_nodes
         )
-        is_tlm = False
-        nst = None # draft number of speculative tokens
-        if prefill_optimization:
-            is_tlm = True
-            nst = num_speculative_tokens
         draft_model_session = create_session(
             target_name=draft_model_name,
             device_group=device_group,
             prefill_seq_len=prefill_seq_len,
             ctx_len=ctx_len,
             full_batch_size=full_batch_size,
-            is_tlm=is_tlm,
+            is_tlm=False,
             include_4d_causal_mask=False,
             topk_logits=TOPK,
             num_cores=5,
-            num_speculative_tokens=nst,
-            num_leaf_nodes=None,
-            tree_len=None,
         )
     else:
         target_model_session, draft_model_session = sessions
@@ -514,8 +451,6 @@ def tree_attn_inference(
         prompts = prompts_exp[:decode_batch_size]
     # tokenize prompts
     prompts_tokenized: List[dict] = []
-    #prefill_retrieve_indices = np.ones((1,2), dtype=np.int64)
-    prefill_retrieve_indices = np.array([[1,1]], dtype=np.int64)
     for p in prompts:
         input_len: int = tokenizer(p, return_tensors="np", padding=True).input_ids.shape[1]
         input_len_padded: int = get_padded_input_len(input_len, prefill_seq_len, ctx_len) # factor of prefill_seq_len
@@ -524,34 +459,49 @@ def tree_attn_inference(
         position_ids = np.where(am, np.arange(input_len_padded), -1)
         p_tok["position_ids"] = position_ids
         p_tok["attention_mask"] = create_4d_causal_mask(position_ids, ctx_len) # shape: [1, 1, input_len_padded, ctx_len]
-        p_tok["num_logits_to_keep"] = np.zeros((2,1), dtype=np.int64)
-        p_tok["retrieve_indices"] = prefill_retrieve_indices
+        #p_tok["num_logits_to_keep"] = np.zeros((1,1), np.int64)
         prompts_tokenized.append(p_tok)
     # create caches to hold generated ids and input prompt lengths
     generated_ids = [[] for i in range(decode_batch_size)]
     input_lengths = [0] * decode_batch_size
     max_gen_len = [ctx_len] * decode_batch_size
     # create dlm decode buffers
-    decode_seq_len = num_speculative_tokens+1 if prefill_optimization else 1
     dlm_decode_inputs = dict(
-        input_ids = np.full((decode_batch_size, decode_seq_len), tokenizer.pad_token_id),
-        position_ids = np.full((decode_batch_size, decode_seq_len), -1, np.int64),
+        input_ids = np.full((decode_batch_size, 1), tokenizer.pad_token_id),
+        position_ids = np.zeros((decode_batch_size, 1), np.int64),
         batch_index = np.arange(decode_batch_size, dtype=np.int64).reshape(-1, 1)
     )
-    if decode_seq_len > 1:
-        dlm_decode_inputs["num_logits_to_keep"] = np.zeros((1,1), dtype=np.int64)
     # create tlm decode buffers
     tlm_precode_inputs = dict(
         input_ids=np.zeros((decode_batch_size, num_tree_nodes), dtype=np.int64),
         position_ids=np.zeros((decode_batch_size, num_tree_nodes), dtype=np.int64),
         batch_index=np.arange(decode_batch_size, dtype=np.int64).reshape(-1, 1),
-        retrieve_indices=retrieve_indices,
-        num_logits_to_keep=np.zeros((num_speculative_tokens+1,1), dtype=np.int64)
     )
+    # generate tree attention buffers
+    tree_buffers = generate_medusa_buffers(tree_attn_choices)
+    tree_mask = tree_buffers["medusa_attn_mask"].numpy().astype(bool) # shape: [1, 1, num_tree_nodes, num_tree_nodes]
+    tree_mask = ~tree_mask # invert to match QEff mask where 1 values will become large negative values
+    tree_indices = tree_buffers["tree_indices"].numpy().astype(np.int64) # shape: [1, num_tree_nodes]
+    tree_position_ids = tree_buffers["medusa_position_ids"].numpy().reshape(1, -1).astype(np.int64) # shape: [1, num_tree_nodes]
+    retrieve_indices = tree_buffers["retrieve_indices"].numpy().astype(np.int64) # shape: [leaf_nodes, num_speculative_tokens+1]
+    num_speculative_tokens = retrieve_indices.shape[1]-1
+    # calculate greedy candidate idx
+    greedy_candidate_idx = np.where(retrieve_indices == -1, np.inf, retrieve_indices).sum(axis=1).argmin().item()
+    #greedy_candidate_idx = retrieve_indices.sum(axis=1).argmin().item() # shape: [1]
+    if debug:
+        print(f"{num_tree_nodes=}")
+        print(f"{tree_mask.astype(int)=}")
+        print(f"{tree_mask.shape=}")
+        print(f"{tree_indices=}")
+        print(f"{tree_indices.shape=}")
+        print(f"{tree_position_ids=}")
+        print(f"{tree_position_ids.shape=}")
+        print(f"{retrieve_indices=}")
+        print(f"{retrieve_indices.shape=}")
+        print(f"{greedy_candidate_idx=}")
     # set prefill logits buffers
     #tlm_prefill_logits = np.zeros((prefill_bsz, 1, vocab_size), dtype=np.float32)
-    logits_seq_len = 4
-    tlm_prefill_logits = np.zeros((prefill_bsz, logits_seq_len), dtype=np.int64)
+    tlm_prefill_logits = np.zeros((prefill_bsz, 1, 1), dtype=np.int64)
     spec_prefill_logits = np.zeros((prefill_bsz, 1, TOPK), dtype=np.int64)
     target_model_session.set_buffers({"logits": tlm_prefill_logits})
     draft_model_session.set_buffers({"logits": spec_prefill_logits})
@@ -569,7 +519,8 @@ def tree_attn_inference(
         ) 
         ttft = perf_counter() - start
         ttfts.append(ttft)
-        input_ids = tlm_logits[:, 0:1].astype(np.int64) # shape: [1, 1]
+        input_ids = tlm_logits[:, :, 0].astype(np.int64) # shape: [1, 1]
+        #input_ids = tlm_logits.argmax(axis=2)[:, :, np.newaxis][:, :, 0].astype(np.int64) # shape: [1, 1]
         common_input_ids = input_ids.item() # common input ids of dlm/tlm
         generated_ids[bi].append(common_input_ids)
         dlm_decode_inputs["input_ids"][bi, 0] = common_input_ids
@@ -586,15 +537,20 @@ def tree_attn_inference(
 
     # set decode logits buffers
     spec_decode_logits = np.zeros((decode_batch_size, 1, TOPK), dtype=np.int64)
+    #spec_decode_nst_topk = np.zeros((decode_batch_size, num_speculative_tokens, TOPK), dtype=np.float32) # buffer will hold logits of each speculation step
     spec_decode_nst_topk = np.zeros((decode_batch_size, num_speculative_tokens, TOPK), dtype=np.int64) # buffer will hold logits of each speculation step
-    logits_seq_len = num_speculative_tokens+3
-    tlm_decode_logits = np.zeros((decode_batch_size, logits_seq_len), dtype=np.int64)
+    tlm_decode_logits = np.zeros((decode_batch_size, num_tree_nodes, 1), dtype=np.int64)
+    #tlm_decode_logits = np.zeros((decode_batch_size, num_tree_nodes, vocab_size), dtype=np.float32)
     target_model_session.set_buffers({"logits": tlm_decode_logits})
     draft_model_session.set_buffers({"logits": spec_decode_logits})
-#    if debug:
-#        draft_model_session.unskip_buffers(
-#            set([x for x in draft_model_session.output_names if x.endswith(RS_SUFFIX)])
-#        )
+    # unskip KV$ RetainedState buffers
+    target_model_session.unskip_buffers(
+        set([x for x in target_model_session.output_names if x.endswith(RS_SUFFIX)])
+    )
+    if debug:
+        draft_model_session.unskip_buffers(
+            set([x for x in draft_model_session.output_names if x.endswith(RS_SUFFIX)])
+        )
     # create frequency matrix to track number of accepted tokens with each respective candidate
     freq = np.zeros_like(retrieve_indices, dtype=np.int64) 
     # start decode phase
@@ -608,6 +564,7 @@ def tree_attn_inference(
     draft_overall_time = 0.0
     target_overall_time = 0.0
     post_process_overall_time = 0.0
+    alignment_overall_time = 0.0
     decode_start = perf_counter()
     while True:
         it += 1
@@ -616,11 +573,8 @@ def tree_attn_inference(
             print(f"{it=}")
         # generate proposals from draft model
         draft_start = perf_counter()
-        valid_inputs_idx = dlm_decode_inputs["position_ids"].argmax(1).item() # TODO: generalize to bsz>1
-        common_token_id: np.ndarray = dlm_decode_inputs["input_ids"][:, valid_inputs_idx:valid_inputs_idx+1].copy() # shape: [decode_batch_size, 1]
-        common_position_id: np.ndarray = dlm_decode_inputs["position_ids"][:, valid_inputs_idx:valid_inputs_idx+1].copy() # shape: [decode_batch_size, 1]
-        #common_token_id: np.ndarray = dlm_decode_inputs["input_ids"][:, -1:].copy() # shape: [decode_batch_size, 1]
-        #common_position_id: np.ndarray = dlm_decode_inputs["position_ids"][:, -1:].copy() # shape: [decode_batch_size, 1]
+        common_token_id: np.ndarray = dlm_decode_inputs["input_ids"][:, -1:].copy() # shape: [decode_batch_size, 1]
+        common_position_id: np.ndarray = dlm_decode_inputs["position_ids"][:, -1:].copy() # shape: [decode_batch_size, 1]
         #print(f"{common_position_id=}")
         #print("dlm_decode_inputs=")
         #pprint(dlm_decode_inputs)
@@ -631,23 +585,18 @@ def tree_attn_inference(
                 valid_batch_indices, 
                 num_speculative_tokens, 
                 spec_decode_nst_topk,
-                debug,
-                prefill_optimization) # shape: [decode_batch_size, num_speculative_tokens, TOPK]
+                debug) # shape: [decode_batch_size, num_speculative_tokens, TOPK]
         else:
             speculate_tokens( 
                 draft_model_session, 
                 dlm_decode_inputs, 
                 valid_batch_indices, 
                 num_speculative_tokens, 
-                spec_decode_nst_topk,
-                debug,
-                prefill_optimization) # shape: [decode_batch_size, num_speculative_tokens, TOPK]
+                spec_decode_nst_topk) # shape: [decode_batch_size, num_speculative_tokens, TOPK]
         # generate speculative tree proposals
         (spec_candidates, # shape: [decode_batch_size, leaf_nodes, num_speculative_tokens+1]
         spec_tree_candidates # shape: [decode_batch_size, num_tree_nodes]
         ) = generate_candidates(common_token_id, spec_decode_nst_topk, tree_indices, retrieve_indices)
-        assert spec_candidates.shape[1:] == retrieve_indices.shape
-        assert spec_tree_candidates.shape[1] == tree_position_ids.shape[1]
         draft_end = perf_counter() - draft_start
         draft_overall_time += draft_end
         target_start = perf_counter()
@@ -667,25 +616,33 @@ def tree_attn_inference(
             print(f"{tlm_precode_inputs['input_ids']=}")
             print(f"{tlm_precode_inputs['position_ids']=}")
         tlm_outputs: dict = target_model_session.run(tlm_precode_inputs) 
-        target_logits: np.ndarray = tlm_outputs["logits"] # shape: [decode_batch_size, logits_seq_len]
-        target_tokens = target_logits[:, :num_speculative_tokens+1]
-        num_tokens_selected = target_logits[:, num_speculative_tokens+1:num_speculative_tokens+1+decode_batch_size]
-        best_path_indices = target_logits[:, num_speculative_tokens+1+decode_batch_size:]
         target_end = perf_counter() - target_start
         target_overall_time += target_end
+        alignment_start = perf_counter()
+        target_logits: np.ndarray = tlm_outputs["logits"] # shape: [decode_batch_size, num_tree_nodes, 1]
+        #target_logits: np.ndarray = tlm_outputs["logits"].argmax(axis=2)[:, :, np.newaxis] # shape: [decode_batch_size, num_tree_nodes, 1]
+        #print(f"{target_logits=}")
+        tlm_candidates = target_logits[:, retrieve_indices, 0] # shape: [decode_batch_size, leaf_nodes, num_speculative_tokens+1]
         if debug:
-            print(f"{target_tokens=}")
+            print(f"{tlm_candidates=}")
+            print(f"{spec_candidates=}")
+        # select best tlm/spec pair of candidates
+        (target_tokens, # shape: [decode_batch_size, num_speculative_tokens+1]
+         spec_tokens, # shape: [decode_batch_size, num_speculative_tokens+1]
+         num_tokens_selected, # shape: [decode_batch_size]
+         best_path_indices, # shape: [decode_batch_size]
+          ) = select_best_candidates(spec_candidates, tlm_candidates)
+        if debug:
             print(f"{num_tokens_selected=}")
             print(f"{best_path_indices=}")
         # record mean number of accepted tokens
-        post_process_start = perf_counter()
         mean_num_accepted_tokens += num_tokens_selected[valid_batch_indices].mean().item()
         # append selected tokens to the generated_ids
         for bi, valid in enumerate(valid_batch_indices):
             if not valid:
                 continue
             # record chosen path and its accepted tokens
-            num_accepted_tokens = num_tokens_selected[bi].item()
+            num_accepted_tokens = num_tokens_selected[bi]
             best_path_idx = best_path_indices[bi]
             freq[best_path_idx, num_accepted_tokens-1] += 1
             # record accepted tokens
@@ -699,16 +656,19 @@ def tree_attn_inference(
                 print(f"{generated_ids=}")
             if len(generated_ids[bi])+num_tree_nodes >= max_gen_len[bi] or ((not ignore_eos_token) and (accepted_tokens_arr == tokenizer.eos_token_id).any()):
                 valid_batch_indices[bi] = False
-        if debug:
-            print(f"{generated_ids=}")
-            text_ids = tokenizer.batch_decode(generated_ids)
-            print(f"{text_ids=}")
         # check if all generations are done
         if not valid_batch_indices.any():
-            post_process_end = perf_counter() - post_process_start
-            post_process_overall_time += post_process_end
             break
+        # align tlm KV$ 
+        retrieve_best_indices = retrieve_indices[best_path_indices] # shape: [decode_batch_size, num_speculative_tokens+1] 
+        align_tlm_kvs(tlm_outputs, tlm_precode_inputs["position_ids"], retrieve_best_indices)
+        mv_retainedstate_buffers_to_decode_input(tlm_outputs, tlm_precode_inputs)
+        if it == 1:
+            target_model_session.unskip_buffers(set([x for x in target_model_session.input_names if x.startswith("past_")]))
+        alignment_end = perf_counter() - alignment_start
+        alignment_overall_time += alignment_end
         # prepare spec decode inputs for next decode iteration
+        post_process_start = perf_counter()
         num_valid_batch_indices = valid_batch_indices.sum().item()
         valid_num_tokens_selected = num_tokens_selected[valid_batch_indices] # shape: [num_valid_batch_indices]
         # create target sequential pids (ignore non-valid batch indices)
@@ -749,13 +709,11 @@ def tree_attn_inference(
     end = perf_counter()
     decode_end = end - decode_start
     e2e_end = end - e2e_start
-    ttft_total = sum(ttfts)
-    mean_ttft = ttft_total / len(ttfts)
-    num_generated_tokens_per_prompt = [len(gid) for gid in generated_ids]
-    num_generated_tokens = sum(num_generated_tokens_per_prompt)
-    decode_throughput = (num_generated_tokens-decode_batch_size) / decode_end
-    e2e_throughput = num_generated_tokens / e2e_end
-    batch_decode = tokenizer.batch_decode(generated_ids) 
+    mean_ttft = sum(ttfts) / len(ttfts)
+    generated_tokens_per_prompt = [len(gid) + 1 for gid in generated_ids]
+    decode_throughput = sum(generated_tokens_per_prompt) / decode_end
+    e2e_throughput = (sum(generated_tokens_per_prompt) + decode_batch_size) / e2e_end
+    batch_decode = tokenizer.batch_decode(generated_ids)
     mean_num_accepted_tokens /= it
     perf_metrics = PerfMetrics(
         mean_ttft,
@@ -764,13 +722,14 @@ def tree_attn_inference(
         e2e_throughput,
         mean_num_accepted_tokens,
         max_gen_len,
-        num_generated_tokens_per_prompt,
+        generated_tokens_per_prompt,
         freq.tolist(),
         e2e_end,
         decode_end,
         draft_overall_time,
         target_overall_time,
-        post_process_overall_time
+        post_process_overall_time,
+        alignment_overall_time
     )
     exec_info = CloudAI100ExecInfo(
         prompts,
@@ -786,7 +745,7 @@ def tree_attn_inference(
         draft_model_name,
         target_model_name,
         full_batch_size,
-        it+1,
+        it,
         tree_attn_choices,
         greedy_candidate_idx
     )
@@ -814,6 +773,7 @@ def arg_parse():
     parser = ArgumentParser(description="Draft-based SpD Inference")
     parser.add_argument("--prompts", type=str, nargs="+", default=Constants.INPUT_STR, help="Input prompt(s)")
     parser.add_argument("--tree-attn-choices", type=List[int], nargs="+", default=[ [0], [0,0], [0,1], [0,2], [1], [1,0], [1,1], [1,2] ], help="Tree attention choices")
+    parser.add_argument("--num-speculative-tokens", type=int, default=2, help="Number of speculative tokens")
     parser.add_argument("--prefill-seq-len", type=int, default=4, help="Prefill sequence length")
     parser.add_argument("--ctx-len", type=int, default=32, help="Context length")
     parser.add_argument("--prefill-bsz", type=int, default=1, help="Prefill batch size")
@@ -830,7 +790,7 @@ def arg_parse():
         "--device-group", type=comma_separated_ints, default="0", help="comma separated device QIDs (e.g., '1,2,3')"
     )
     parser.add_argument('--record', action='store_true')
-    parser.add_argument('--ignore-eos-token', action='store_true')
+    parser.add_argument('--ignore_eos_token', action='store_true')
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
     return args

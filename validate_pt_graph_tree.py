@@ -616,8 +616,6 @@ def tree_attn_inference(
             print(f"{best_path_indices=}")
         # record mean number of accepted tokens
         mean_num_accepted_tokens += num_tokens_selected[valid_batch_indices].mean().item()
-        if it==4:
-            breakpoint()
         # append selected tokens to the generated_ids
         for bi, valid in enumerate(valid_batch_indices):
             if not valid:

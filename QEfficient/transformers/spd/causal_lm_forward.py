@@ -178,13 +178,9 @@ def tlm_forward(
         print(f"{best_path_indices=}")
         print(f"{retrieve_best_indices=}")
         # generate sequential and dispersed pids
-        #position_ids = position_ids.to(torch.int32)
-        #retrieve_best_indices = retrieve_best_indices.to(torch.int32) # gather expects dtype int64 for index
         aligned_pids, dispersed_pids = generate_sequential_and_dispersed_pids(position_ids, retrieve_best_indices)
         print(f"{aligned_pids=}")
         print(f"{dispersed_pids=}")
-        #aligned_pids = aligned_pids.to(torch.int32)
-        #dispersed_pids = dispersed_pids.to(torch.int32)
         # align kv$
         cache_kwargs = {"batch_index": batch_index}
         for decode_layer_idx in range(len(self.model.layers)):
@@ -200,7 +196,7 @@ def tlm_forward(
     return CausalLMOutputWithPast(
         loss=None,
         logits=logits,
-        past_key_values=outputs.past_key_values,
+        past_key_values = outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
     )

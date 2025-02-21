@@ -230,7 +230,6 @@ def run_prefill_on_draft_and_target(
     tlm_outputs = tlm(**inputs)
     inputs["past_key_values"] = draft_pkvs
     del inputs["attention_mask"]
-    del inputs["retrieve_indices"]
     dlm_outputs = dlm(**inputs)
     cast_np(tlm_outputs)
     cast_np(dlm_outputs)

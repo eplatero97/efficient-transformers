@@ -79,6 +79,7 @@ class CloudAI100ExecInfo:
     draft_model_name: str
     target_model_name: str
     full_batch_size: Optional[int]
+    iterations: int
 
     def __repr__(self):
         return (
@@ -430,6 +431,7 @@ def draft_spec_decode_inference(
         draft_model_name,
         target_model_name,
         full_batch_size,
+        it,
     )
     return exec_info
 

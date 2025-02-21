@@ -55,6 +55,7 @@ class QEFFTransformersBase(QEFFBaseModel):
         is_tlm: bool = False,
         topk_logits: Optional[int] = None,
         include_4d_causal_mask: bool = False,
+        include_retrieve_indices: bool = False,
         *args,
         **kwargs,
     ):
@@ -67,7 +68,7 @@ class QEFFTransformersBase(QEFFBaseModel):
         kwargs.update({"attn_implementation": "eager", "low_cpu_mem_usage": False})
 
         model = cls._hf_auto_class.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        return cls(model, is_tlm=is_tlm, topk_logits=topk_logits, include_4d_causal_mask=include_4d_causal_mask)
+        return cls(model, is_tlm=is_tlm, topk_logits=topk_logits, include_4d_causal_mask=include_4d_causal_mask, include_retrieve_indices=include_retrieve_indices)
 
     @property
     def model_name(self) -> str:
@@ -109,6 +110,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         is_tlm: bool = False,
         topk_logits: Optional[int] = None,
         include_4d_causal_mask: bool = False,
+        include_retrieve_indices: bool = False,
         **kwargs,
     ):
         model_class_name = model.__class__.__name__
@@ -129,6 +131,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         self.num_layers = model.config.num_hidden_layers
         self.continuous_batching = continuous_batching
         self.include_4d_causal_mask = include_4d_causal_mask
+        self.include_retrieve_indices = include_retrieve_indices
 
         if is_tlm or topk_logits:
             if topk_logits:
@@ -147,6 +150,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         is_tlm: bool = False,
         topk_logits: Optional[int] = None,
         include_4d_causal_mask: bool = False,
+        include_retrieve_indices: bool = False,
         *args,
         **kwargs,
     ):
@@ -181,7 +185,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
             )
 
         self = super().from_pretrained(
-            pretrained_model_name_or_path, is_tlm=is_tlm, topk_logits=topk_logits, include_4d_causal_mask=include_4d_causal_mask, *args, **kwargs
+            pretrained_model_name_or_path, is_tlm=is_tlm, topk_logits=topk_logits, include_4d_causal_mask=include_4d_causal_mask, include_retrieve_indices=include_retrieve_indices, *args, **kwargs
         )
         self.continuous_batching = continuous_batching
         return self
@@ -195,6 +199,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
         mhash.update(to_hashable({"is_tlm": self.is_tlm}))
         mhash.update(to_hashable({"topk_logits": self.topk_logits}))
         mhash.update(to_hashable({"include_4d_causal_mask": self.include_4d_causal_mask}))
+        mhash.update(to_hashable({"include_retrieve_indices": self.include_retrieve_indices}))
         mhash.update(to_hashable(self._transform_names()))
         mhash = mhash.hexdigest()[:16]
         return mhash
@@ -233,6 +238,8 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
                 2: "seq_len", 
                 3: "ctx_len"
             }
+        if self.include_retrieve_indices:
+            assert self.include_4d_causal_mask
             nlk = constants.ONNX_EXPORT_EXAMPLE_NLK  # Number of Logits to Keep
             example_inputs["retrieve_indices"] = torch.ones((bs,nlk), dtype=torch.int64)
             dynamic_axes["retrieve_indices"] = {
@@ -357,7 +364,7 @@ class QEFFAutoModelForCausalLM(QEFFTransformersBase):
             specializations.append(decode_specialization)
 
         if num_leaf_nodes is not None:
-            assert tree_len is not None and isinstance(tree_len, int)
+            assert self.include_retrieve_indices and self.include_4d_causal_mask and tree_len is not None and isinstance(tree_len, int)
             specializations[0]["num_leaf_nodes"] = 1
             specializations[0]["num_logits_to_keep"] = 2
             specializations[0]["tree_len"] = 2
