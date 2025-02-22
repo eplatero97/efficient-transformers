@@ -221,6 +221,7 @@ def run_prefill_on_draft_and_target(
     tlm: torch.nn,
     dlm: torch.nn,
     inputs: dict,
+    device,
 ):
 
     input_len = inputs["input_ids"].shape[1]
@@ -231,18 +232,20 @@ def run_prefill_on_draft_and_target(
     prefill_retrieve_indices = np.ones((1,2), dtype=np.int64)
     inputs["retrieve_indices"] = prefill_retrieve_indices
     inputs["num_logits_to_keep"] = np.zeros((2,1), dtype=np.int64)
-    cast_pt(inputs)
+    cast_pt(inputs, device)
     target_pkvs = inputs.pop("target_past_key_values")
     draft_pkvs = inputs.pop("draft_past_key_values")
     inputs["past_key_values"] = target_pkvs
     inputs["position_ids"].is_tree = True
-    tlm_outputs = tlm(**inputs)
+    with torch.no_grad():
+        tlm_outputs = tlm(**inputs)
     inputs["past_key_values"] = draft_pkvs
     del inputs["attention_mask"]
     del inputs["retrieve_indices"]
     del inputs["num_logits_to_keep"]
     inputs["position_ids"].is_tree = False
-    dlm_outputs = dlm(**inputs)
+    with torch.no_grad():
+        dlm_outputs = dlm(**inputs)
     cast_np(tlm_outputs)
     cast_np(dlm_outputs)
     return tlm_outputs, dlm_outputs
@@ -288,12 +291,13 @@ def split_dlm_bonus_token_inputs(dlm_decode_inputs: dict) -> List[dict]:
 
     return inputs
 
-def speculate_tokens(dlm: torch.nn, dlm_decode_inputs: dict, valid_batch_indices: np.ndarray, num_speculative_tokens: int, spec_decode_nst_topk: np.ndarray):
+def speculate_tokens(dlm: torch.nn, dlm_decode_inputs: dict, valid_batch_indices: np.ndarray, num_speculative_tokens: int, spec_decode_nst_topk: np.ndarray, device):
     input_len = dlm_decode_inputs["input_ids"].shape[1]
     #dlm_decode_inputs["num_logits_to_keep"] = np.zeros((input_len,1), dtype=np.int64)
-    cast_pt(dlm_decode_inputs)
+    cast_pt(dlm_decode_inputs, device)
     for k_ in range(num_speculative_tokens):
-        dlm_outputs = dlm(**dlm_decode_inputs)
+        with torch.no_grad():
+            dlm_outputs = dlm(**dlm_decode_inputs)
         dlm_logits = dlm_outputs["logits"][:, -1:, :] # shape: [decode_batch_size, 1, TOPK] # TOPK indices (descending order)
         spec_decode_nst_topk[:, k_] = dlm_logits.squeeze(1).detach().numpy()
         input_ids = dlm_logits[:, -1:, 0] # shape: [decode_batch_size, 1]
@@ -403,16 +407,16 @@ def cast_np(inputs: dict):
         else:
             raise ValueError(f"key {key} has value of type {type(val)}")
 
-def cast_pt(inputs: dict):
+def cast_pt(inputs: dict, device=torch.device('cpu')):
     for key,val in inputs.items():
         if isinstance(val, np.ndarray):
-            inputs[key] = torch.from_numpy(val)
+            inputs[key] = torch.from_numpy(val).to(device)
         elif isinstance(val, tuple):
             # tuple kv$
             past_key_values = []
             for pkv in val:
                 past_key, past_value = pkv
-                past_key, past_value = torch.from_numpy(past_key), torch.from_numpy(past_value)
+                past_key, past_value = torch.from_numpy(past_key).to(device), torch.from_numpy(past_value).to(device)
                 past_key_values.append((past_key, past_value))
             inputs[key] = tuple(past_key_values)
         else:
@@ -438,6 +442,7 @@ def tree_attn_inference(
     ignore_eos_token: bool = True,
     debug: bool = False
 ):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_tree_nodes = len(tree_attn_choices)+1 # +1 to account for root node
     # assumes dlm and tlm are compiled to the same prompt-chunk-size, context length and full_batch_size/batch-size
     # get vocab size
@@ -463,13 +468,13 @@ def tree_attn_inference(
     topk_logits=None
     tlm = AutoModelForCausalLM.from_pretrained(
         target_model_name, continuous_batching=continuous_batching, is_tlm=is_tlm, include_4d_causal_mask=include_4d_causal_mask, topk_logits=topk_logits
-    ).model
+    ).model.to(device)
     is_tlm=False
     include_4d_causal_mask=False
     topk_logits=TOPK
     dlm = AutoModelForCausalLM.from_pretrained(
         draft_model_name, continuous_batching=continuous_batching, is_tlm=is_tlm, include_4d_causal_mask=include_4d_causal_mask, topk_logits=topk_logits
-    ).model
+    ).model.to(device)
     # create pkvs
     target_pkvs = create_pkvs(tlm.config, batch_size=1, seq_len=32)
     draft_pkvs = create_pkvs(dlm.config, batch_size=1, seq_len=32)
@@ -523,6 +528,7 @@ def tree_attn_inference(
             tlm=tlm,
             dlm=dlm,
             inputs=prompts_tokenized[bi],
+            device=device,
         ) 
         tlm_logits = tlm_outputs["logits"]
         ttft = perf_counter() - start
@@ -579,7 +585,8 @@ def tree_attn_inference(
             dlm_decode_inputs, 
             valid_batch_indices, 
             num_speculative_tokens, 
-            spec_decode_nst_topk)
+            spec_decode_nst_topk,
+            device)
         # generate speculative tree proposals
         (spec_candidates, # shape: [decode_batch_size, leaf_nodes, num_speculative_tokens+1]
         spec_tree_candidates # shape: [decode_batch_size, num_tree_nodes]
@@ -601,9 +608,10 @@ def tree_attn_inference(
         if debug:
             print(f"{tlm_precode_inputs['input_ids']=}")
             print(f"{tlm_precode_inputs['position_ids']=}")
-        cast_pt(tlm_precode_inputs)
+        cast_pt(tlm_precode_inputs, device)
         tlm_precode_inputs["position_ids"].is_tree = True
-        tlm_outputs: dict = tlm(**tlm_precode_inputs) 
+        with torch.no_grad():
+            tlm_outputs: dict = tlm(**tlm_precode_inputs) 
         cast_np(tlm_outputs)
         cast_np(tlm_precode_inputs)
         target_logits = tlm_outputs["logits"]
