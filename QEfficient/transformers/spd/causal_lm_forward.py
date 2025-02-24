@@ -44,7 +44,7 @@ def filter_hidden_states(
     lower_idx = torch.where(logit_index < num_logits_to_keep, 0, logit_index + 1 - num_logits_to_keep).view(
         -1, 1
     )  # shape: [bsz, 1]
-    spec_idx = torch.arange(num_logits_to_keep).view(1, -1)  # shape: [1, k]
+    spec_idx = torch.arange(num_logits_to_keep, device=position_ids.device).view(1, -1)  # shape: [1, k]
     indices = torch.add(lower_idx, spec_idx).unsqueeze(2)  # shape: [bsz, k, 1]
     indices = indices.repeat(1, 1, hidden_states.size(-1))  # shape: [bsz, ,k, d_model]
     hidden_states = torch.gather(hidden_states, dim=1, index=indices)  # shape: [bsz, k, d_model]
@@ -59,7 +59,7 @@ def select_best_candidates(spec_candidates: torch.Tensor, target_candidates: tor
     #min_indices = torch.argmin(posterior_mask.to(torch.int64), dim=2) # not supported by qaic optimization, shape: [decode_batch_size, leaf_nodes]
     #min_indices[(min_indices==0) & (posterior_mask.sum(dim=2)==num_speculative_tokens)] = num_speculative_tokens
     #candidates_accept_length = min_indices
-    cumsum_mask = posterior_mask.to(torch.int64).cumsum(dim=2) == (torch.arange(num_speculative_tokens, dtype=torch.int64)+1)
+    cumsum_mask = posterior_mask.to(torch.int64).cumsum(dim=2) == (torch.arange(num_speculative_tokens, dtype=torch.int64, device=spec_candidates.device)+1)
     candidates_accept_length = cumsum_mask.sum(dim=2)
     num_tokens_selected = candidates_accept_length.max(dim=1).values + 1 # shape: [deode_batch_size]
     best_path_indices = torch.argmax(candidates_accept_length, dim=1) # shape: [decode_batch_size]
@@ -70,10 +70,13 @@ def generate_sequential_and_dispersed_pids(position_ids, retrieve_best_indices):
     bsz, n_nodes = position_ids.size()
     num_speculative_tokens = retrieve_best_indices.size(1) - 1 
     root_pids = position_ids[:, 0] # shape: [decode_batch_size]
-    tree_seq_pids = torch.arange(1, n_nodes, dtype=torch.int32).view(1,-1).repeat(bsz, 1) + root_pids # shape: [decode_batch_size, n_nodes-1]
+    tree_seq_pids = torch.arange(1, n_nodes, dtype=torch.int32, device=position_ids.device).view(1,-1).repeat(bsz, 1) + root_pids # shape: [decode_batch_size, n_nodes-1]
     aligned_pids = tree_seq_pids[:, :num_speculative_tokens] # ctx_len indices that will be updated, shape: [decode_batch_size, num_speculative_tokens]
     no_root_best_indices = retrieve_best_indices[:, 1:] - 1 # retrieve only non-root indices, shape: [decode_batch_size, num_speculative_tokens]
+    negative_indices = no_root_best_indices < 0
+    no_root_best_indices[negative_indices] = 0
     dispersed_pids = torch.gather(tree_seq_pids, 1, no_root_best_indices) # ctx_len indices that will be extracted, shape: [decode_batch_size, num_speculative_tokens]
+    no_root_best_indices[negative_indices] = -1
     return aligned_pids, dispersed_pids
 
 def tlm_forward(
@@ -123,7 +126,6 @@ def tlm_forward(
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
     )
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-    print(f"{position_ids=}")
 
     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
     outputs = self.model(
@@ -164,23 +166,20 @@ def tlm_forward(
         else:
             target_tree_tokens = logits[:, :, 0:1]
         target_candidates = target_tree_tokens[:, retrieve_indices, 0] # shape: [bsz, *retrieve_indices.size()]
-        spec_candidates = input_ids[:, retrieve_indices] # shape: [bsz, *retrieve_indices.size()]
-        print(f"{target_tree_tokens=}")
-        print(f"{target_candidates=}")
-        print(f"{spec_candidates=}")
+        #spec_candidates = input_ids[:, retrieve_indices] # shape: [bsz, *retrieve_indices.size()]
+        bsz = input_ids.size(0)
+        zeros = torch.zeros((bsz,1), device=input_ids.device, dtype=input_ids.dtype)
+        iids_ext = torch.cat((input_ids, zeros), dim=1)
+        spec_candidates = iids_ext[:, retrieve_indices] # shape: [bsz, *retrieve_indices.size()]
+        #spec_candidates = input_ids.cat([:, retrieve_indices] # shape: [bsz, *retrieve_indices.size()]
         # select best candidate
         (best_tlm_paths, # shape: [bsz, num_speculative_tokens+1]
             best_path_indices, # shape: [bsz]
             num_tokens_selected, # shape: [bsz]
             ) = select_best_candidates(spec_candidates, target_candidates)
         retrieve_best_indices = retrieve_indices[best_path_indices] # shape: [bsz, num_speculative_tokens+1]
-        print(f"{num_tokens_selected=}")
-        print(f"{best_path_indices=}")
-        print(f"{retrieve_best_indices=}")
         # generate sequential and dispersed pids
         aligned_pids, dispersed_pids = generate_sequential_and_dispersed_pids(position_ids, retrieve_best_indices)
-        print(f"{aligned_pids=}")
-        print(f"{dispersed_pids=}")
         # align kv$
         cache_kwargs = {"batch_index": batch_index}
         for decode_layer_idx in range(len(self.model.layers)):

@@ -40,7 +40,7 @@ def _create_causal_mask(
         attention_mask = attention_mask.unsqueeze(1)
     else:
         query_indices = position_ids.unsqueeze(-1)
-        kv_indices = torch.arange(target_length).view(1, 1, -1)
+        kv_indices = torch.arange(target_length, device=position_ids.device).view(1, 1, -1)
         attention_mask = kv_indices > query_indices
         attention_mask = attention_mask.unsqueeze(1)
 
