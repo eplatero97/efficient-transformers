@@ -73,7 +73,9 @@ def generate_sequential_and_dispersed_pids(position_ids, retrieve_best_indices):
     tree_seq_pids = torch.arange(1, n_nodes, dtype=torch.int32).view(1,-1).repeat(bsz, 1) + root_pids # shape: [decode_batch_size, n_nodes-1]
     aligned_pids = tree_seq_pids[:, :num_speculative_tokens] # ctx_len indices that will be updated, shape: [decode_batch_size, num_speculative_tokens]
     no_root_best_indices = retrieve_best_indices[:, 1:] - 1 # retrieve only non-root indices, shape: [decode_batch_size, num_speculative_tokens]
-    dispersed_pids = torch.gather(tree_seq_pids, 1, no_root_best_indices) # ctx_len indices that will be extracted, shape: [decode_batch_size, num_speculative_tokens]
+    #dispersed_pids = torch.gather(tree_seq_pids, 1, no_root_best_indices) # ctx_len indices that will be extracted, shape: [decode_batch_size, num_speculative_tokens] TODO: generalize to bsz>1 since gather does not work with negative indices
+    dispersed_pids = tree_seq_pids[:, no_root_best_indices] # ctx_len indices that will be extracted, shape: [decode_batch_size, num_speculative_tokens] TODO: generalize to bsz>1 since gather does not work with negative indices
+    dispersed_pids.shape == torch.Size([bsz, num_speculative_tokens])
     return aligned_pids, dispersed_pids
 
 def tlm_forward(
@@ -164,7 +166,9 @@ def tlm_forward(
         else:
             target_tree_tokens = logits[:, :, 0:1]
         target_candidates = target_tree_tokens[:, retrieve_indices, 0] # shape: [bsz, *retrieve_indices.size()]
-        spec_candidates = input_ids[:, retrieve_indices] # shape: [bsz, *retrieve_indices.size()]
+        zeros = torch.zeros((input_ids.size(0),1), dtype=input_ids.dtype, device=input_ids.device)
+        iids_ext = torch.cat((input_ids, zeros), dim=1)
+        spec_candidates = iids_ext[:, retrieve_indices] # shape: [bsz, *retrieve_indices.size()]
         print(f"{target_tree_tokens=}")
         print(f"{target_candidates=}")
         print(f"{spec_candidates=}")

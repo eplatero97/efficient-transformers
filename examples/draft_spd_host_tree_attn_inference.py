@@ -137,6 +137,8 @@ def align_tlm_kvs(
     tree_seq_pids = np.arange(1, n_nodes).reshape(1,-1).repeat(decode_batch_size, axis=0) + root_pids # shape: [decode_batch_size, n_nodes-1]
     aligned_pids = tree_seq_pids[:, :num_speculative_tokens] # ctx_len indices that will be updated, shape: [decode_batch_size, num_speculative_tokens]
     no_root_best_indices = retrieve_best_indices[:, 1:] - 1 # retrieve only non-root indices, shape: [decode_batch_size, num_speculative_tokens]
+    neg_indices = no_root_best_indices < -1
+    no_root_best_indices[neg_indices] = -1
     dispersed_pids = np.take_along_axis(tree_seq_pids, no_root_best_indices, axis=1) # ctx_len indices that will be extracted, shape: [decode_batch_size, num_speculative_tokens+1]
     # expand pids to kv shape
     dispersed_pids_exp = dispersed_pids[:, np.newaxis, :, np.newaxis]
@@ -467,7 +469,7 @@ def tree_attn_inference(
     max_gen_len = [ctx_len] * decode_batch_size
     # create dlm decode buffers
     dlm_decode_inputs = dict(
-        input_ids = np.full((decode_batch_size, 1), tokenizer.pad_token_id),
+        input_ids = np.full((decode_batch_size, 1), 0),
         position_ids = np.zeros((decode_batch_size, 1), np.int64),
         batch_index = np.arange(decode_batch_size, dtype=np.int64).reshape(-1, 1)
     )

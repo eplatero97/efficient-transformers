@@ -440,7 +440,8 @@ def tree_attn_inference(
     draft_model_name: str,
     target_model_name: str,
     ignore_eos_token: bool = True,
-    debug: bool = False
+    debug: bool = False,
+    models = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_tree_nodes = len(tree_attn_choices)+1 # +1 to account for root node
@@ -462,22 +463,25 @@ def tree_attn_inference(
     # calculate greedy candidate idx
     greedy_candidate_idx = np.where(retrieve_indices == -1, np.inf, retrieve_indices).sum(axis=1).argmin().item()
     # get QEff model
-    continuous_batching = False
-    is_tlm=True
-    include_4d_causal_mask=True
-    topk_logits=None
-    tlm = AutoModelForCausalLM.from_pretrained(
-        target_model_name, continuous_batching=continuous_batching, is_tlm=is_tlm, include_4d_causal_mask=include_4d_causal_mask, topk_logits=topk_logits
-    ).model.to(device)
-    is_tlm=False
-    include_4d_causal_mask=False
-    topk_logits=TOPK
-    dlm = AutoModelForCausalLM.from_pretrained(
-        draft_model_name, continuous_batching=continuous_batching, is_tlm=is_tlm, include_4d_causal_mask=include_4d_causal_mask, topk_logits=topk_logits
-    ).model.to(device)
+    if models is None:
+        continuous_batching = False
+        is_tlm=True
+        include_4d_causal_mask=True
+        topk_logits=None
+        tlm = AutoModelForCausalLM.from_pretrained(
+            target_model_name, continuous_batching=continuous_batching, is_tlm=is_tlm, include_4d_causal_mask=include_4d_causal_mask, topk_logits=topk_logits
+        ).model.to(device)
+        is_tlm=False
+        include_4d_causal_mask=False
+        topk_logits=TOPK
+        dlm = AutoModelForCausalLM.from_pretrained(
+            draft_model_name, continuous_batching=continuous_batching, is_tlm=is_tlm, include_4d_causal_mask=include_4d_causal_mask, topk_logits=topk_logits
+        ).model.to(device)
+    else:
+        dlm, tlm = models
     # create pkvs
-    target_pkvs = create_pkvs(tlm.config, batch_size=1, seq_len=32)
-    draft_pkvs = create_pkvs(dlm.config, batch_size=1, seq_len=32)
+    target_pkvs = create_pkvs(tlm.config, batch_size=1, seq_len=ctx_len)
+    draft_pkvs = create_pkvs(dlm.config, batch_size=1, seq_len=ctx_len)
     # tokenize prompts
     decode_batch_size = 1
     prompts_tokenized: List[dict] = []

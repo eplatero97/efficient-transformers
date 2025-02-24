@@ -7,7 +7,7 @@
 
 # https://github.com/FasterDecoding/Medusa/blob/main/medusa/model/utils.py
 
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import torch
@@ -170,7 +170,8 @@ def generate_candidates(candidates_logit, topk_spec_logits, tree_indices, retrie
 
     # Extend the tree candidates by appending a zero.
     tree_candidates_ext = np.concatenate(
-        [tree_candidates, np.zeros((bsz, 1), dtype=np.int64)], axis=-1
+        #[tree_candidates, np.zeros((bsz, 1), dtype=np.int64)], axis=-1 # extend to zero so that if `retrieve_inices` has -1, it will just pick it up (acutaly retrieve_indices will never go to that lenght unless i'ts value is -1)
+        [tree_candidates, np.full((bsz, 1), -1, dtype=np.int64)], axis=-1 # extend to zero so that if `retrieve_inices` has -1, it will just pick it up (acutaly retrieve_indices will never go to that lenght unless i'ts value is -1)
     )  # shape: [bsz, n_nodes+1]
     # tree_candidates_ext = torch.cat([tree_candidates, torch.zeros((1), dtype=torch.long, device=tree_candidates.device)], dim=0)
 
@@ -214,3 +215,62 @@ def create_4d_causal_mask(
         #causal_mask[:, :, :, -tree_len:] = tree_mask
 
     return causal_mask
+
+
+def bfs_sort(lst):
+    return sorted(lst, key=lambda x: (len(x), [i for i in x]))
+
+def group_by_depth(tree_attn_choices):
+    sorted_choices = bfs_sort(tree_attn_choices)
+    grouped_list = []
+    current_length = len(sorted_choices[0])
+    current_group = []
+
+    for elem in sorted_choices:
+        if len(elem) == current_length:
+            current_group.append(elem)
+        else:
+            grouped_list.append(current_group)
+            current_length = len(elem)
+            current_group = [elem]
+    grouped_list.append(current_group)
+    return grouped_list
+
+
+def parent_child_counts(tree_attn_choices) -> List[List[List[int]]]:
+    n_elms_per_path = [len(path) for path in tree_attn_choices]
+    max_tree_depth = max(n_elms_per_path) # tree depth starts from 0
+    out = [[] for i in range(max_tree_depth)]
+    out[0].append([0,0]) # root node
+    tree_attn_choices = bfs_sort(tree_attn_choices)
+    nodes_per_depth = group_by_depth(tree_attn_choices)
+    prev_parent_idx = [0]
+    counter = 0
+    prev_depth = 1
+    for path in tree_attn_choices:
+        n_nodes = len(path)
+        if n_nodes == 1:
+                out[0][0][1] += 1
+                continue
+        #parent_idx = path[-2]
+        parent_idx = path[:-1]
+        curr_depth = n_nodes-1
+        if curr_depth-1 == prev_depth:
+            depth_bfs_nodes = nodes_per_depth[curr_depth-2]
+            relative_idx = depth_bfs_nodes.index(prev_parent_idx)
+            out[prev_depth].append([relative_idx, counter])
+            prev_depth += 1
+            prev_parent_idx = parent_idx
+            counter = 1
+            continue
+        if parent_idx == prev_parent_idx:
+             counter += 1
+        else:
+             
+             depth_bfs_nodes = nodes_per_depth[curr_depth-1]
+             relative_idx = depth_bfs_nodes.index(prev_parent_idx)
+             out[curr_depth].append([relative_idx, counter])
+             counter = 1
+             prev_parent_idx = parent_idx
+    out[curr_depth].append([parent_idx[-1], counter])
+    return out
